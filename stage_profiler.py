@@ -59,8 +59,11 @@ def monitor_control_plane_scheduling(pod_name: str, namespace: str):
     Detect when the Kubernetes scheduler assigns a node to this Pod,
     emit a span and a histogram metric of the scheduling duration.
     """
-    # Load in-cluster config and Kubernetes API client
-    config.load_incluster_config()
+    # Try in-cluster config first, fallback to kubeconfig if not in cluster
+    try:
+        config.load_incluster_config()
+    except Exception:
+        config.load_kube_config()
     v1 = client.CoreV1Api()
 
     # Fetch Pod creation timestamp
@@ -96,8 +99,10 @@ def monitor_control_plane_scheduling(pod_name: str, namespace: str):
     # Record a histogram metric
     scheduling_histogram.record(duration, {"pod_name": pod_name})
 
+    return duration
+
 
 if __name__ == "__main__":
     pod_name = os.getenv("HOSTNAME")
-    monitor_control_plane_scheduling(pod_name, NAMESPACE)
+    duration = monitor_control_plane_scheduling(pod_name, NAMESPACE)
     print(f"Control-plane scheduling for pod {pod_name} took {duration:.3f}s")
