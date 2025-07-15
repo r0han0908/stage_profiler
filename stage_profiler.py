@@ -2,6 +2,7 @@
 
 import os
 import time
+import traceback
 from kubernetes import client, config as k8s_config
 from datetime import datetime
 from opentelemetry import trace, metrics
@@ -12,6 +13,7 @@ from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExport
 from opentelemetry.sdk.metrics import MeterProvider
 from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
 from opentelemetry.exporter.otlp.proto.grpc.metric_exporter import OTLPMetricExporter
+from opentelemetry.trace import use_span
 
 # ─── Configuration ─────────────────────────────────────────────────────────────
 SERVICE_NAME            = os.getenv("SERVICE_NAME", "my-app")
@@ -52,8 +54,7 @@ try:
 except Exception:
     k8s_config.load_kube_config()
 v1 = client.CoreV1Api()
-ev = client.CoreV1Api()  # events API
-
+ev = client.CoreV1Api()  # events are part of CoreV1
 
 def find_application_pod(namespace: str, service: str) -> str:
     """
@@ -67,15 +68,15 @@ def find_application_pod(namespace: str, service: str) -> str:
         raise RuntimeError(f"No pods found for Knative service '{service}' in ns '{namespace}'")
     return pods.items[0].metadata.name
 
-
 def monitor_control_plane_scheduling(pod_name: str, namespace: str) -> float:
     """
-    Measure and emit the time from Pod creation to scheduling event.
+    Measure and emit the time from Pod creation to the 'Scheduled' event.
     """
+    # Fetch creation timestamp
     pod = v1.read_namespaced_pod(pod_name, namespace)
     creation_ts = pod.metadata.creation_timestamp
 
-    # Poll Events for "Scheduled" reason
+    # Poll events until we see the Scheduled event
     scheduled_ts = None
     while scheduled_ts is None:
         events = ev.list_namespaced_event(
@@ -91,39 +92,39 @@ def monitor_control_plane_scheduling(pod_name: str, namespace: str) -> float:
 
     duration = (scheduled_ts - creation_ts).total_seconds()
 
-    # Emit OTLP span
-    with tracer.start_as_current_span(
-        "control-plane-scheduling",
-        start_time=creation_ts.timestamp(),
-        end_time=scheduled_ts.timestamp()
-    ) as span:
+    # Manually start a span with a custom start timestamp
+    span = tracer.start_span("control-plane-scheduling", start_time=creation_ts.timestamp())
+    # Activate it without auto-ending
+    with use_span(span, end_on_exit=False):
         span.set_attribute("pod.name", pod_name)
         span.set_attribute("node", pod.spec.node_name)
         span.set_attribute("duration_s", duration)
+    # Explicitly end with the scheduled timestamp
+    span.end(end_time=scheduled_ts.timestamp())
 
     # Record histogram metric
     scheduling_histogram.record(duration, {"pod_name": pod_name})
+
     print(f"[control-plane-scheduling] {pod_name} → {duration:.3f}s")
-
     return duration
-
 
 if __name__ == "__main__":
     try:
-        # Wait for the Knative pod to appear
+        # Wait until the Knative revision pod is present
         print(f"Waiting for pod of service '{SERVICE_NAME}' in ns '{NAMESPACE}'…")
         while True:
             try:
+                # inside Knative container, HOSTNAME is the pod name
                 pod_name = os.getenv("HOSTNAME") or find_application_pod(NAMESPACE, SERVICE_NAME)
                 break
             except RuntimeError:
                 time.sleep(1)
-        
+
         print(f"Found pod: {pod_name}, starting profiling…")
         monitor_control_plane_scheduling(pod_name, NAMESPACE)
-        # TODO: call additional monitor_... functions here
+        # TODO: add more monitor_* calls for other stages here
 
     except Exception as e:
         print("ERROR in stage_profiler:", e)
-        import traceback; traceback.print_exc()
+        traceback.print_exc()
         exit(1)
