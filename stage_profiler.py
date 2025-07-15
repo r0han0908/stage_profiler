@@ -52,23 +52,30 @@ try:
 except Exception:
     k8s_config.load_kube_config()
 v1 = client.CoreV1Api()
-ev = client.CoreV1Api()  # events are also under CoreV1
+ev = client.CoreV1Api()  # events API
+
 
 def find_application_pod(namespace: str, service: str) -> str:
+    """
+    Find the first Pod belonging to the Knative service via its label.
+    """
     pods = v1.list_namespaced_pod(
         namespace=namespace,
         label_selector=f"serving.knative.dev/service={service}"
     )
     if not pods.items:
-        raise RuntimeError(f"No pods found for Knative service '{service}'")
+        raise RuntimeError(f"No pods found for Knative service '{service}' in ns '{namespace}'")
     return pods.items[0].metadata.name
 
+
 def monitor_control_plane_scheduling(pod_name: str, namespace: str) -> float:
-    # fetch Pod creation time
+    """
+    Measure and emit the time from Pod creation to scheduling event.
+    """
     pod = v1.read_namespaced_pod(pod_name, namespace)
     creation_ts = pod.metadata.creation_timestamp
 
-    # poll Events for the "Scheduled" reason
+    # Poll Events for "Scheduled" reason
     scheduled_ts = None
     while scheduled_ts is None:
         events = ev.list_namespaced_event(
@@ -80,12 +87,11 @@ def monitor_control_plane_scheduling(pod_name: str, namespace: str) -> float:
                 scheduled_ts = e.last_timestamp or e.event_time
                 break
         if scheduled_ts is None:
-            time.sleep(0.1)
+            time.sleep(0.2)
 
-    # compute duration
     duration = (scheduled_ts - creation_ts).total_seconds()
 
-    # emit OTLP span with explicit timestamps
+    # Emit OTLP span
     with tracer.start_as_current_span(
         "control-plane-scheduling",
         start_time=creation_ts.timestamp(),
@@ -95,19 +101,28 @@ def monitor_control_plane_scheduling(pod_name: str, namespace: str) -> float:
         span.set_attribute("node", pod.spec.node_name)
         span.set_attribute("duration_s", duration)
 
-    # record histogram metric
+    # Record histogram metric
     scheduling_histogram.record(duration, {"pod_name": pod_name})
     print(f"[control-plane-scheduling] {pod_name} → {duration:.3f}s")
 
     return duration
 
+
 if __name__ == "__main__":
     try:
-        # prefer HOSTNAME if set (in Pod), else discover dynamically
-        pod_name = os.getenv("HOSTNAME") or find_application_pod(NAMESPACE, SERVICE_NAME)
-        print(f"Profiling pod: {pod_name}")
+        # Wait for the Knative pod to appear
+        print(f"Waiting for pod of service '{SERVICE_NAME}' in ns '{NAMESPACE}'…")
+        while True:
+            try:
+                pod_name = os.getenv("HOSTNAME") or find_application_pod(NAMESPACE, SERVICE_NAME)
+                break
+            except RuntimeError:
+                time.sleep(1)
+        
+        print(f"Found pod: {pod_name}, starting profiling…")
         monitor_control_plane_scheduling(pod_name, NAMESPACE)
-        # TODO: call other stage monitors here...
+        # TODO: call additional monitor_... functions here
+
     except Exception as e:
         print("ERROR in stage_profiler:", e)
         import traceback; traceback.print_exc()
