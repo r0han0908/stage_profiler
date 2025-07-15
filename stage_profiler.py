@@ -116,8 +116,11 @@ def monitor_control_plane_scheduling(pod_name: str, namespace: str) -> float:
         span.set_attribute("end_time_s", scheduled_ts)
         span.set_attribute("duration_s", duration)
 
-    # Record histogram metric
-    scheduling_histogram.record(duration, {"pod_name": pod_name})
+    # Record histogram metric (with error handling)
+    try:
+        scheduling_histogram.record(duration, {"pod_name": pod_name})
+    except Exception as e:
+        print(f"Metric recording error: {e}")
 
     print(f"[control-plane-scheduling] {pod_name} → {duration:.6f}s")
     return duration
