@@ -1,15 +1,20 @@
 #!/usr/bin/env python3
 """
-Full life-cycle profiler for a Knative / Kubernetes pod.
-Stages captured (spans):
-  1. control-plane-scheduling
-  2. image-pull
-  3. container-creation
-  4. network-warmup
-  5. runtime-startup
-  6. app-init
-  7. first-request
+Full life-cycle profiler for a Knative / Kubernetes pod
+(7 “cold-start” stages → OTLP traces + console table)
+
+Stages captured
+─────────────────────────────────────────────────────────────
+1. control-plane-scheduling   Pod admitted → Scheduled
+2. image-pull & unpack        Pulling  → Pulled
+3. container-creation & init  Pulled   → Created
+4. network / proxy warm-up    q-proxy  start → ready
+5. runtime start-up           user-ctr start → …
+6. app-init                   user-ctr ready
+7. first-request overhead     first 200 OK from pod IP
 """
+
+from __future__ import annotations
 
 import argparse, os, sys, time, urllib.request
 from datetime import datetime, timezone
@@ -23,10 +28,12 @@ from opentelemetry.sdk.trace.export import BatchSpanProcessor
 from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
 
 # ───────────────────────── defaults ──────────────────────────
-SERVICE   = os.getenv("SERVICE_NAME", "nginx")
-NAMESPACE = os.getenv("NAMESPACE",   "default")
-OTLP_EP   = os.getenv("OTEL_COLLECTOR_ENDPOINT",
-                      "otel-collector.observability.svc.cluster.local:4317")
+SERVICE_DEFAULT   = os.getenv("SERVICE_NAME", "nginx")
+NAMESPACE_DEFAULT = os.getenv("NAMESPACE",      "default")
+OTLP_EP_DEFAULT   = os.getenv(
+    "OTEL_COLLECTOR_ENDPOINT",
+    "otel-collector.observability.svc.cluster.local:4317",
+)
 
 # ─────────────────── Kubernetes client ───────────────────────
 try:
@@ -34,17 +41,38 @@ try:
 except Exception:
     k8s_config.load_kube_config()
 v1 = client.CoreV1Api()
-ev = client.CoreV1Api()       # events are in CoreV1 too
 
-# ─────────────────── helper functions ────────────────────────
-def resolve_pod(ns: str, svc: Optional[str], pod: Optional[str]) -> str:
+def resolve_pod(
+    ns: str,
+    service: Optional[str],
+    pod: Optional[str],
+    pod_prefix: Optional[str],
+) -> str:
+    """
+    Decide which pod to monitor.
+
+    priority: --pod  >  --pod-prefix  >  --service
+    """
+    # explicit pod
     if pod:
         return pod
+
+    # prefix match
+    if pod_prefix:
+        pods = v1.list_namespaced_pod(ns).items
+        for p in pods:
+            if p.metadata.name.startswith(pod_prefix):
+                return p.metadata.name
+        sys.exit(f"No pod in ns '{ns}' starts with '{pod_prefix}'.")
+
+    # first pod belonging to the Knative Service
+    if service is None:
+        sys.exit("Need at least --service when neither --pod nor --pod-prefix is given.")
     pods = v1.list_namespaced_pod(
-        ns, label_selector=f"serving.knative.dev/service={svc}"
+        ns, label_selector=f"serving.knative.dev/service={service}"
     ).items
     if not pods:
-        sys.exit(f"No pods found for service '{svc}' in namespace '{ns}'.")
+        sys.exit(f"No pods found for service '{service}' in namespace '{ns}'.")
     return pods[0].metadata.name
 
 
@@ -55,17 +83,27 @@ def http_ok(ip: str, port: int = 80, path: str = "/", tout: float = 0.3) -> bool
     except Exception:
         return False
 
+
 # ─────────────────────── main ────────────────────────────────
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--namespace", default=NAMESPACE)
-    ap.add_argument("--service",   default=SERVICE)
-    ap.add_argument("--pod")
-    ap.add_argument("--endpoint",  default=OTLP_EP)
+    ap.add_argument("--namespace",   default=NAMESPACE_DEFAULT)
+    ap.add_argument("--service",     default=SERVICE_DEFAULT,
+                    help="Knative Service name (ignored when --pod given)")
+    ap.add_argument("--pod",         help="Exact pod name")
+    ap.add_argument("--pod-prefix",  help="First pod whose name starts with this")
+    ap.add_argument("--endpoint",    default=OTLP_EP_DEFAULT,
+                    help="OTLP/gRPC collector endpoint host:port")
     args = ap.parse_args()
 
-    pod_name = resolve_pod(args.namespace, args.service, args.pod)
-    print(f"▶ full-stage profiler on pod {pod_name}")
+    pod_name = resolve_pod(
+        args.namespace,
+        args.service,
+        args.pod,
+        args.pod_prefix,
+    )
+
+    print(f"▶ profiling pod {pod_name} …")
 
     # tracer setup
     tp = TracerProvider(
@@ -76,60 +114,43 @@ def main() -> None:
         })
     )
     tp.add_span_processor(
-        BatchSpanProcessor(
-            OTLPSpanExporter(endpoint=args.endpoint, insecure=True)
-        )
+        BatchSpanProcessor(OTLPSpanExporter(endpoint=args.endpoint, insecure=True))
     )
     trace.set_tracer_provider(tp)
     tracer = trace.get_tracer(__name__)
 
-    ts: Dict[str, datetime] = {}   # collected timestamps
-    done = set()                   # spans already emitted
+    ts: Dict[str, datetime] = {}   # timestamps
+    done = set()                   # finished spans
 
-    # ─── polling loop ─────────────────────────────────────────
     while True:
         pod = v1.read_namespaced_pod(pod_name, args.namespace)
+        events = client.CoreV1Api().list_namespaced_event(
+            args.namespace,
+            field_selector=f"involvedObject.name={pod_name},involvedObject.kind=Pod",
+        ).items
 
-        # creation timestamp (always available)
-        if "created" not in ts:
-            ts["created"] = pod.metadata.creation_timestamp.replace(
-                tzinfo=timezone.utc
-            )
+        # always available
+        ts.setdefault("created", pod.metadata.creation_timestamp.replace(tzinfo=timezone.utc))
 
-        # 1. control-plane scheduling (event “Scheduled”)
+        # Scheduled event
         if "scheduled" not in ts:
-            evs = ev.list_namespaced_event(
-                args.namespace,
-                field_selector=f"involvedObject.name={pod_name},involvedObject.kind=Pod"
-            ).items
-            for e in evs:
+            for e in events:
                 if e.reason == "Scheduled":
-                    ts["scheduled"] = (e.last_timestamp or e.event_time).replace(
-                        tzinfo=timezone.utc
-                    )
+                    ts["scheduled"] = (e.last_timestamp or e.event_time).replace(tzinfo=timezone.utc)
                     break
 
-        # 2 & 3 use normal pod events
-        if {"pulling", "pulled", "created_cntr"} - ts.keys():
-            for e in evs:
-                if e.reason == "Pulling" and "pulling" not in ts:
-                    ts["pulling"] = (e.last_timestamp or e.event_time).replace(
-                        tzinfo=timezone.utc
-                    )
-                if e.reason == "Pulled" and "pulled" not in ts:
-                    ts["pulled"] = (e.last_timestamp or e.event_time).replace(
-                        tzinfo=timezone.utc
-                    )
-                if e.reason == "Created" and "created_cntr" not in ts:
-                    ts["created_cntr"] = (e.last_timestamp or e.event_time).replace(
-                        tzinfo=timezone.utc
-                    )
+        # Pulling / Pulled / Created
+        for e in events:
+            if e.reason == "Pulling" and "pulling" not in ts:
+                ts["pulling"] = (e.last_timestamp or e.event_time).replace(tzinfo=timezone.utc)
+            if e.reason == "Pulled" and "pulled" not in ts:
+                ts["pulled"] = (e.last_timestamp or e.event_time).replace(tzinfo=timezone.utc)
+            if e.reason == "Created" and "created_cntr" not in ts:
+                ts["created_cntr"] = (e.last_timestamp or e.event_time).replace(tzinfo=timezone.utc)
 
-        # container status snapshots
-        qp = next((cs for cs in pod.status.container_statuses
-                   if cs.name == "queue-proxy"), None)
-        uc = next((cs for cs in pod.status.container_statuses
-                   if cs.name == "user-container"), None)
+        # container statuses
+        qp = next((c for c in pod.status.container_statuses or [] if c.name == "queue-proxy"), None)
+        uc = next((c for c in pod.status.container_statuses or [] if c.name == "user-container"), None)
 
         if qp and qp.state.running and "qp_run" not in ts:
             ts["qp_run"] = qp.state.running.started_at.replace(tzinfo=timezone.utc)
@@ -142,25 +163,18 @@ def main() -> None:
             ts["user_ready"] = datetime.now(timezone.utc)
 
         # first request
-        if "user_ready" in ts and "first_req" not in ts:
+        if "user_ready" in ts and "first_req" not in ts and pod.status.pod_ip:
             if http_ok(pod.status.pod_ip):
                 ts["first_req"] = datetime.now(timezone.utc)
 
-        # ─── emit spans whenever both ends are known ──────────
+        # ─── emit spans ──────────────────────────────────────────
         def emit(name: str, a: str, b: str) -> None:
-            if (
-                a in ts and b in ts
-                and ts[a] is not None and ts[b] is not None
-                and b not in done
-                and ts[b] >= ts[a]
-            ):
+            if a in ts and b in ts and b not in done and ts[b] >= ts[a]:
                 start_ns = int(ts[a].timestamp() * 1e9)
                 end_ns   = int(ts[b].timestamp() * 1e9)
-
                 sp = tracer.start_span(name, start_time=start_ns)
                 sp.end(end_time=end_ns)
-
-                print(f"✓ {name:<25} {(ts[b] - ts[a]).total_seconds():7.3f}s")
+                print(f"✓ {name:<23} {(ts[b] - ts[a]).total_seconds():7.3f}s")
                 done.add(b)
 
         emit("control-plane-scheduling", "created",     "scheduled")
