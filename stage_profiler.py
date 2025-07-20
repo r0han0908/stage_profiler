@@ -14,7 +14,7 @@ import argparse, os, sys, time, urllib.request
 from datetime import datetime, timezone
 from typing import Dict, Optional
 
-from kubernetes import client, config as k8s_config, watch
+from kubernetes import client, config as k8s_config
 from opentelemetry import trace
 from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import TracerProvider
@@ -22,7 +22,7 @@ from opentelemetry.sdk.trace.export import BatchSpanProcessor
 from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
 
 # ── defaults (env‑overridable) ─────────────────────────────────────────────
-SERVICE_DEFAULT   = os.getenv("SERVICE_NAME", "nginx")
+SERVICE_DEFAULT   = os.getenv("SERVICE_NAME", "error")
 NAMESPACE_DEFAULT = os.getenv("NAMESPACE",      "default")
 OTLP_EP_DEFAULT   = os.getenv("OTEL_COLLECTOR_ENDPOINT",
                                "otel-collector.observability.svc.cluster.local:4317")
@@ -44,18 +44,13 @@ def resolve_pod(
     Decide which pod to monitor.
     priority: --pod token (substring match)  >  --service (first pod)
     """
-    # --pod given → try exact first, fall back to substring match
     if pod_token:
-        try:                                 # exact?
-            v1.read_namespaced_pod(pod_token, ns)
-            return pod_token
-        except client.exceptions.ApiException:
-            pods = v1.list_namespaced_pod(ns).items
-            for p in pods:
-                if pod_token in p.metadata.name:
-                    return p.metadata.name
+        pods = v1.list_namespaced_pod(ns).items
+        matching_pods = [p.metadata.name for p in pods if pod_token in p.metadata.name]
+        if not matching_pods:
             sys.exit(f"No pod in ns '{ns}' contains '{pod_token}'.")
-    # no --pod → use service selector
+        return matching_pods[0]
+
     if not service:
         sys.exit("Need --service when --pod not provided.")
     pods = v1.list_namespaced_pod(
@@ -103,72 +98,78 @@ def main() -> None:
     ts: Dict[str, datetime] = {}
     done = set()
 
-    while True:
-        pod = v1.read_namespaced_pod(pod_name, args.namespace)
-        events = v1.list_namespaced_event(
-            args.namespace,
-            field_selector=f"involvedObject.name={pod_name},involvedObject.kind=Pod",
-        ).items
+    with open("stage_profiler.log", "w") as log_file:
+        log_file.write(f"Profiling pod: {pod_name}\n")
+        while True:
+            pod = v1.read_namespaced_pod(pod_name, args.namespace)
+            events = v1.list_namespaced_event(
+                args.namespace,
+                field_selector=f"involvedObject.name={pod_name},involvedObject.kind=Pod",
+            ).items
 
-        # creation
-        ts.setdefault("created", pod.metadata.creation_timestamp.replace(tzinfo=timezone.utc))
-        # scheduled
-        if "scheduled" not in ts:
+            # creation
+            ts.setdefault("created", pod.metadata.creation_timestamp.replace(tzinfo=timezone.utc))
+            # scheduled
+            if "scheduled" not in ts:
+                for e in events:
+                    if e.reason == "Scheduled":
+                        ts["scheduled"] = (e.last_timestamp or e.event_time).replace(tzinfo=timezone.utc)
+                        break
+            # image pull / container create
             for e in events:
-                if e.reason == "Scheduled":
-                    ts["scheduled"] = (e.last_timestamp or e.event_time).replace(tzinfo=timezone.utc)
-                    break
-        # image pull / container create
-        for e in events:
-            if e.reason == "Pulling"  and "pulling"      not in ts:
-                ts["pulling"]       = (e.last_timestamp or e.event_time).replace(tzinfo=timezone.utc)
-            if e.reason == "Pulled"   and "pulled"       not in ts:
-                ts["pulled"]        = (e.last_timestamp or e.event_time).replace(tzinfo=timezone.utc)
-            if e.reason == "Created"  and "created_ctr"  not in ts:
-                ts["created_ctr"]   = (e.last_timestamp or e.event_time).replace(tzinfo=timezone.utc)
+                if e.reason == "Pulling"  and "pulling"      not in ts:
+                    ts["pulling"]       = (e.last_timestamp or e.event_time).replace(tzinfo=timezone.utc)
+                if e.reason == "Pulled"   and "pulled"       not in ts:
+                    ts["pulled"]        = (e.last_timestamp or e.event_time).replace(tzinfo=timezone.utc)
+                if e.reason == "Created"  and "created_ctr"  not in ts:
+                    ts["created_ctr"]   = (e.last_timestamp or e.event_time).replace(tzinfo=timezone.utc)
 
-        # container status marks
-        qp = next((c for c in (pod.status.container_statuses or []) if c.name == "queue-proxy"), None)
-        uc = next((c for c in (pod.status.container_statuses or []) if c.name == "user-container"), None)
+            # container status marks
+            qp = next((c for c in (pod.status.container_statuses or []) if c.name == "queue-proxy"), None)
+            uc = next((c for c in (pod.status.container_statuses or []) if c.name == "user-container"), None)
 
-        if qp and qp.state.running and "qp_run" not in ts:
-            ts["qp_run"] = qp.state.running.started_at.replace(tzinfo=timezone.utc)
-        if qp and qp.ready and "qp_ready" not in ts:
-            ts["qp_ready"] = datetime.now(timezone.utc)
+            if qp and qp.state.running and "qp_run" not in ts:
+                ts["qp_run"] = qp.state.running.started_at.replace(tzinfo=timezone.utc)
+            if qp and qp.ready and "qp_ready" not in ts:
+                ts["qp_ready"] = datetime.now(timezone.utc)
 
-        if uc and uc.state.running and "user_run" not in ts:
-            ts["user_run"] = uc.state.running.started_at.replace(tzinfo=timezone.utc)
-        if uc and uc.ready and "user_ready" not in ts:
-            ts["user_ready"] = datetime.now(timezone.utc)
+            if uc and uc.state.running and "user_run" not in ts:
+                ts["user_run"] = uc.state.running.started_at.replace(tzinfo=timezone.utc)
+            if uc and uc.ready and "user_ready" not in ts:
+                ts["user_ready"] = datetime.now(timezone.utc)
 
-        if "user_ready" in ts and "first_req" not in ts and pod.status.pod_ip:
-            if http_ok(pod.status.pod_ip):
-                ts["first_req"] = datetime.now(timezone.utc)
+            if "user_ready" in ts and "first_req" not in ts and pod.status.pod_ip:
+                if http_ok(pod.status.pod_ip):
+                    ts["first_req"] = datetime.now(timezone.utc)
 
-        # emit helper
-        def emit(name: str, a: str, b: str) -> None:
-            if a in ts and b in ts and b not in done and ts[b] >= ts[a]:
-                dur = (ts[b] - ts[a]).total_seconds()
-                sp = tracer.start_span(name, start_time=int(ts[a].timestamp()*1e9))
-                sp.set_attribute("duration_s", dur)    # explicit seconds
-                sp.end(end_time=int(ts[b].timestamp()*1e9))
-                print(f"✓ {name:<23} {dur:8.3f}s")
-                done.add(b)
+            # emit helper
+            def emit(name: str, a: str, b: str) -> None:
+                if a in ts and b in ts and b not in done and ts[b] >= ts[a]:
+                    dur = (ts[b] - ts[a]).total_seconds()
+                    sp = tracer.start_span(name, start_time=int(ts[a].timestamp()*1e9))
+                    sp.set_attribute("duration_s", dur)
+                    sp.end(end_time=int(ts[b].timestamp()*1e9))
+                    msg = f"✓ {name:<23} {dur:8.3f}s"
+                    print(msg)
+                    log_file.write(msg + "\n")
+                    log_file.flush()
+                    done.add(b)
 
-        emit("control-plane-scheduling", "created",     "scheduled")
-        emit("image-pull",               "pulling",     "pulled")
-        emit("container-creation",       "pulled",      "created_ctr")
-        emit("network-warmup",           "qp_run",      "qp_ready")
-        emit("runtime-startup",          "qp_ready",    "user_run")
-        emit("app-init",                 "user_run",    "user_ready")
-        emit("first-request",            "user_ready",  "first_req")
+            emit("control-plane-scheduling", "created",     "scheduled")
+            emit("image-pull",               "pulling",     "pulled")
+            emit("container-creation",       "pulled",      "created_ctr")
+            emit("network-warmup",           "qp_run",      "qp_ready")
+            emit("runtime-startup",          "qp_ready",    "user_run")
+            emit("app-init",                 "user_run",    "user_ready")
+            emit("first-request",            "user_ready",  "first_req")
 
-        if len(done) == 7:
-            print("🎉 all stages captured – exiting")
-            tp.shutdown()
-            break
-        time.sleep(0.5)
-
+            if len(done) == 7:
+                print("🎉 all stages captured – exiting")
+                log_file.write("🎉 all stages captured – exiting\n")
+                log_file.flush()
+                tp.shutdown()
+                break
+            time.sleep(0.5)
 
 if __name__ == "__main__":
     main()
