@@ -11,15 +11,11 @@ Stages captured
 5. runtime‑startup
 6. app‑init
 7. first‑request
-
-Every completed stage is:
- • logged as a JSON line to stage_profiler.log
- • exported as an OTLP trace span          (duration attribute = seconds)
 """
 
 import argparse, json, os, sys, time, urllib.request
 from datetime import datetime, timezone
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional  # ← 3.8‑style typing
 
 from kubernetes import client, config as k8s_config
 from opentelemetry import trace
@@ -28,7 +24,7 @@ from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
 from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
 
-# ────────────── defaults (env‑override) ──────────────────
+# ────────────── defaults ───────────────────────────────────
 SERVICE   = os.getenv("SERVICE_NAME", "nginx")
 NAMESPACE = os.getenv("NAMESPACE",   "default")
 OTLP_EP   = os.getenv(
@@ -37,36 +33,28 @@ OTLP_EP   = os.getenv(
 )
 LOG_PATH  = os.getenv("STAGE_PROFILER_LOG", "stage_profiler.log")
 
-# ────────────── Kubernetes client ────────────────────────
+# ────────────── Kubernetes client ─────────────────────────
 try:
     k8s_config.load_incluster_config()
 except Exception:
     k8s_config.load_kube_config()
 v1 = client.CoreV1Api()
-ev = client.CoreV1Api()        # events live in CoreV1 too
+ev = client.CoreV1Api()   # events API
 
-# ────────────── utilities ────────────────────────────────
+# ────────────── helpers ───────────────────────────────────
 def first_pod_matching(namespace: str, substr: str) -> Optional[str]:
-    """Return first pod whose name *contains* substr (case‑sensitive)."""
-    pods = v1.list_namespaced_pod(namespace=namespace).items
-    for p in pods:
+    for p in v1.list_namespaced_pod(namespace=namespace).items:
         if substr in p.metadata.name:
             return p.metadata.name
     return None
 
 
-def resolve_pod(ns: str, service: str | None, pod_prefix: str | None) -> str:
-    """
-    Decide which pod to monitor.
-      * if --pod is given → use first pod whose name contains that string
-      * else               → first pod of the Knative service (label selector)
-    """
+def resolve_pod(ns: str, service: Optional[str], pod_prefix: Optional[str]) -> str:
     if pod_prefix:
-        pod = first_pod_matching(ns, pod_prefix)
-        if pod:
-            return pod
-        sys.exit(f"No pod with name containing '{pod_prefix}' in ns '{ns}'.")
-    # fallback to service label
+        match = first_pod_matching(ns, pod_prefix)
+        if match:
+            return match
+        sys.exit(f"No pod whose name contains '{pod_prefix}' in ns '{ns}'.")
     pods = v1.list_namespaced_pod(
         ns, label_selector=f"serving.knative.dev/service={service}"
     ).items
@@ -77,33 +65,30 @@ def resolve_pod(ns: str, service: str | None, pod_prefix: str | None) -> str:
 
 def http_ok(ip: str, port: int = 80, path: str = "/", tout: float = 0.3) -> bool:
     try:
-        with urllib.request.urlopen(
-            f"http://{ip}:{port}{path}", timeout=tout
-        ) as r:
+        with urllib.request.urlopen(f"http://{ip}:{port}{path}", timeout=tout) as r:
             return 200 <= r.status < 400
     except Exception:
         return False
 
 
-def log_json(entry: Dict):
-    """Append one JSON line to LOG_PATH."""
+def log_json(entry: Dict) -> None:
     with open(LOG_PATH, "a", buffering=1) as fp:
         fp.write(json.dumps(entry) + "\n")
 
 
-# ────────────── main profiler loop ───────────────────────
+# ────────────── profiler ──────────────────────────────────
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--namespace", default=NAMESPACE)
     ap.add_argument("--service",   default=SERVICE)
-    ap.add_argument("--pod", help="substring / prefix of pod‑name to attach to")
+    ap.add_argument("--pod", help="substring / prefix to match pod name")
     ap.add_argument("--endpoint",  default=OTLP_EP)
     args = ap.parse_args()
 
     pod_name = resolve_pod(args.namespace, args.service, args.pod)
-    print(f"▶ profiling pod {pod_name} …")
+    print(f"▶ profiling pod {pod_name}")
 
-    # tracer
+    # OpenTelemetry tracer setup
     tp = TracerProvider(
         resource=Resource.create({
             "service.name":       args.service,
@@ -125,10 +110,10 @@ def main() -> None:
     while True:
         pod = v1.read_namespaced_pod(pod_name, args.namespace)
 
-        # Creation TS (always available)
-        ts.setdefault("created", pod.metadata.creation_timestamp.replace(tzinfo=timezone.utc))
+        ts.setdefault("created",
+                      pod.metadata.creation_timestamp.replace(tzinfo=timezone.utc))
 
-        # Events
+        # events
         events = ev.list_namespaced_event(
             args.namespace,
             field_selector=f"involvedObject.name={pod_name},involvedObject.kind=Pod"
@@ -146,9 +131,11 @@ def main() -> None:
             elif e.reason == "Created":
                 ts.setdefault("created_cntr", when)
 
-        # ContainerStatus checks
-        qp = next((cs for cs in pod.status.container_statuses or [] if cs.name == "queue-proxy"), None)
-        uc = next((cs for cs in pod.status.container_statuses or [] if cs.name == "user-container"), None)
+        # container statuses
+        qp = next((cs for cs in pod.status.container_statuses or []
+                   if cs.name == "queue-proxy"), None)
+        uc = next((cs for cs in pod.status.container_statuses or []
+                   if cs.name == "user-container"), None)
 
         if qp and qp.state.running:
             ts.setdefault("qp_run", qp.state.running.started_at.replace(tzinfo=timezone.utc))
@@ -159,21 +146,19 @@ def main() -> None:
         if uc and uc.ready:
             ts.setdefault("user_ready", datetime.now(timezone.utc))
 
-        # First request once user‑container ready
         if "user_ready" in ts and "first_req" not in ts and http_ok(pod.status.pod_ip):
             ts["first_req"] = datetime.now(timezone.utc)
 
-        # Emit spans
-        def emit(stage: str, a: str, b: str):
+        # emit spans
+        def emit(stage: str, a: str, b: str) -> None:
             if stage in done or a not in ts or b not in ts:
                 return
             dur = (ts[b] - ts[a]).total_seconds()
             with tracer.start_as_current_span(stage,
-                                              start_time=int(ts[a].timestamp()*1e9)) as sp:
+                                              start_time=int(ts[a].timestamp() * 1e9)) as sp:
                 sp.set_attribute("duration_s", round(dur, 3))
-                sp.end(end_time=int(ts[b].timestamp()*1e9))
-            done.append(stage)
-            print(f"✓ {stage:<23} {dur:>7.3f}s")
+                sp.end(end_time=int(ts[b].timestamp() * 1e9))
+            print(f"✓ {stage:<23} {dur:7.3f}s")
             log_json({
                 "stage": stage,
                 "pod":   pod_name,
@@ -181,6 +166,7 @@ def main() -> None:
                 "end":   ts[b].isoformat(),
                 "duration_s": round(dur, 3)
             })
+            done.append(stage)
 
         emit("control-plane-scheduling", "created",     "scheduled")
         emit("image-pull",               "pulling",     "pulled")
