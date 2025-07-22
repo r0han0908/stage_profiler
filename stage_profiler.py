@@ -11,7 +11,7 @@ Stages captured (spans)
   6. app‑init
   7. first‑request
 
-NEW  ›  a configurable warm‑up delay (default 60 s) before monitoring starts.
+NEW  ›  a configurable warm‑up delay (default 10 s) before monitoring starts.
 """
 
 from __future__ import annotations  # safe even on py3.8
@@ -32,7 +32,7 @@ SERVICE   = os.getenv("SERVICE_NAME", "nginx")
 NAMESPACE = os.getenv("NAMESPACE",   "default")
 OTLP_EP   = os.getenv("OTEL_COLLECTOR_ENDPOINT",
                       "otel-collector.observability.svc.cluster.local:4317")
-WARMUP_DEFAULT = int(os.getenv("WARMUP_SECS", "60"))
+WARMUP_DEFAULT = int(os.getenv("WARMUP_SECS", "10"))
 
 # ─── Kubernetes client ─────────────────────────────────────────────────────
 try:
@@ -83,11 +83,11 @@ def main() -> None:
 
     # Warm‑up delay ---------------------------------------------------------
     if args.warmup > 0:
-        print(f"☕ Waiting {args.warmup}s before starting profiling …")
+        print(f"Waiting {args.warmup}s before starting profiling …")
         time.sleep(args.warmup)
 
     pod_name = resolve_pod(args.namespace, args.service, args.pod)
-    print(f"▶ profiling pod {pod_name}")
+    print(f"Profiling pod {pod_name}")
 
     # Tracer setup ----------------------------------------------------------
     tp = TracerProvider(
@@ -173,7 +173,7 @@ def main() -> None:
                 end_ns   = int(ts[b].timestamp() * 1e9)
                 span = tracer.start_span(name, start_time=start_ns)
                 span.end(end_time=end_ns)
-                print(f"✓ {name:<23} {(ts[b]-ts[a]).total_seconds():8.3f}s")
+                print(f"{name:<23} {(ts[b]-ts[a]).total_seconds():8.3f}s")
                 done.add(b)
 
         emit("control-plane-scheduling", "created",     "scheduled")
@@ -185,7 +185,7 @@ def main() -> None:
         emit("first-request",            "user_ready",  "first_req")
 
         if len(done) == 7:
-            print("🎉 all stages captured – exiting")
+            print("All stages captured – exiting")
             tp.shutdown()
             break
 
