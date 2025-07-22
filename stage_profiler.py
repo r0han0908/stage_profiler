@@ -16,7 +16,7 @@ NEW  ›  a configurable warm‑up delay (default 10 s) before monitoring star
 
 from __future__ import annotations  # safe even on py3.8
 
-import argparse, os, sys, time, urllib.request
+import argparse, os, sys, time, urllib.request, socket
 from datetime import datetime, timezone
 from typing import Dict, Optional
 
@@ -67,6 +67,20 @@ def http_ok(ip: str, port: int = 80, path: str = "/", tout: float = 0.3) -> bool
     except Exception:
         return False
 
+
+def wait_for_port(host: str, port: int, timeout: int = 60):
+    print(f"Waiting for {host}:{port} to become available ...")
+    start = time.time()
+    while time.time() - start < timeout:
+        try:
+            with socket.create_connection((host, port), timeout=2):
+                print("OTLP collector is reachable.")
+                return
+        except Exception:
+            time.sleep(2)
+    sys.exit("Timed out waiting for OTLP collector.")
+
+
 # ─── main ──────────────────────────────────────────────────────────────────
 def main() -> None:
     ap = argparse.ArgumentParser()
@@ -85,6 +99,11 @@ def main() -> None:
     if args.warmup > 0:
         print(f"Waiting {args.warmup}s before starting profiling …")
         time.sleep(args.warmup)
+
+    # Wait for OTLP collector endpoint to become available
+    if ":" in args.endpoint:
+        host, port = args.endpoint.split(":")
+        wait_for_port(host.strip(), int(port.strip()))
 
     pod_name = resolve_pod(args.namespace, args.service, args.pod)
     print(f"Profiling pod {pod_name}")
