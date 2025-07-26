@@ -14,7 +14,7 @@ Stages captured (spans)
 NEW  ›  a configurable warm‑up delay (default 10 s) before monitoring starts.
 """
 
-from __future__ import annotations  # safe even on py3.8
+from __future__ import annotations
 
 import argparse, os, sys, time, urllib.request, socket
 from datetime import datetime, timezone
@@ -33,6 +33,7 @@ NAMESPACE = os.getenv("NAMESPACE",   "default")
 OTLP_EP   = os.getenv("OTEL_COLLECTOR_ENDPOINT",
                       "otel-collector.observability.svc.cluster.local:4317")
 WARMUP_DEFAULT = int(os.getenv("WARMUP_SECS", "10"))
+TIMEOUT_SECS = int(os.getenv("PROFILER_TIMEOUT", "180"))
 
 # ─── Kubernetes client ─────────────────────────────────────────────────────
 try:
@@ -40,18 +41,16 @@ try:
 except Exception:
     k8s_config.load_kube_config()
 v1 = client.CoreV1Api()
-ev = client.CoreV1Api()          # Events live in CoreV1
+ev = client.CoreV1Api()
 
 # ─── helpers ───────────────────────────────────────────────────────────────
 def resolve_pod(ns: str, service: str | None, pod_prefix: str | None) -> str:
-    """Return the first pod name that matches either label or prefix."""
     if pod_prefix:
         pods = v1.list_namespaced_pod(ns).items
         for p in pods:
             if pod_prefix in p.metadata.name:
                 return p.metadata.name
         sys.exit(f"No pod name containing '{pod_prefix}' found in ns '{ns}'.")
-    # label‑based lookup (Knative service)
     pods = v1.list_namespaced_pod(
         ns, label_selector=f"serving.knative.dev/service={service}"
     ).items
@@ -68,47 +67,45 @@ def http_ok(ip: str, port: int = 80, path: str = "/", tout: float = 0.3) -> bool
         return False
 
 
-def wait_for_port(host: str, port: int, timeout: int = 60):
+def wait_for_port(host: str, port: int, timeout: int = 60) -> bool:
     print(f"Waiting for {host}:{port} to become available ...")
     start = time.time()
     while time.time() - start < timeout:
         try:
+            resolved_ip = socket.gethostbyname(host)
+            print(f"Resolved {host} to {resolved_ip}")
             with socket.create_connection((host, port), timeout=2):
                 print("OTLP collector is reachable.")
-                return
-        except Exception:
+                return True
+        except Exception as e:
+            print(f"[retrying] OTLP connect error: {e}")
             time.sleep(2)
-    sys.exit("Timed out waiting for OTLP collector.")
+    print("Timed out waiting for OTLP collector — continuing without it.")
+    return False
 
 
 # ─── main ──────────────────────────────────────────────────────────────────
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--namespace", default=NAMESPACE)
-    ap.add_argument("--service",   default=SERVICE,
-                    help="Knative service name (for label lookup)")
-    ap.add_argument("--pod",
-                    help="Substring to match pod names (skips label lookup)")
-    ap.add_argument("--endpoint",  default=OTLP_EP,
-                    help="OTLP gRPC collector endpoint")
-    ap.add_argument("--warmup", type=int, default=WARMUP_DEFAULT,
-                    help=f"seconds to wait before monitoring (default {WARMUP_DEFAULT})")
+    ap.add_argument("--service",   default=SERVICE)
+    ap.add_argument("--pod", help="Substring to match pod names (skips label lookup)")
+    ap.add_argument("--endpoint",  default=OTLP_EP)
+    ap.add_argument("--warmup", type=int, default=WARMUP_DEFAULT)
     args = ap.parse_args()
 
-    # Warm‑up delay ---------------------------------------------------------
     if args.warmup > 0:
-        print(f"Waiting {args.warmup}s before starting profiling …")
+        print(f"Waiting {args.warmup}s before starting profiling ...")
         time.sleep(args.warmup)
 
-    # Wait for OTLP collector endpoint to become available
+    otel_ready = False
     if ":" in args.endpoint:
         host, port = args.endpoint.split(":")
-        wait_for_port(host.strip(), int(port.strip()))
+        otel_ready = wait_for_port(host.strip(), int(port.strip()))
 
     pod_name = resolve_pod(args.namespace, args.service, args.pod)
     print(f"Profiling pod {pod_name}")
 
-    # Tracer setup ----------------------------------------------------------
     tp = TracerProvider(
         resource=Resource.create({
             "service.name":      args.service,
@@ -116,26 +113,37 @@ def main() -> None:
             "k8s.pod.name":      pod_name,
         })
     )
-    tp.add_span_processor(
-        BatchSpanProcessor(
-            OTLPSpanExporter(endpoint=args.endpoint, insecure=True)
+
+    if otel_ready:
+        tp.add_span_processor(
+            BatchSpanProcessor(
+                OTLPSpanExporter(endpoint=args.endpoint, insecure=True)
+            )
         )
-    )
+    else:
+        print("OTLP exporter disabled.")
+
     trace.set_tracer_provider(tp)
     tracer = trace.get_tracer(__name__)
 
-    ts: Dict[str, datetime] = {}   # timestamps collected
-    done = set()                  # spans already emitted
+    ts: Dict[str, datetime] = {}
+    done = set()
+    start_time = datetime.now(timezone.utc)
 
-    # Poll loop -------------------------------------------------------------
     while True:
+        now = datetime.now(timezone.utc)
+        if (now - start_time).total_seconds() > TIMEOUT_SECS:
+            print("Timeout reached. Some stages were not captured:")
+            for key in ['scheduled', 'pulling', 'pulled', 'created_cntr',
+                        'qp_run', 'qp_ready', 'user_run', 'user_ready', 'first_req']:
+                if key not in ts:
+                    print(f"  - {key}")
+            tp.shutdown()
+            break
+
         pod = v1.read_namespaced_pod(pod_name, args.namespace)
+        ts.setdefault("created", pod.metadata.creation_timestamp.replace(tzinfo=timezone.utc))
 
-        # creation timestamp
-        ts.setdefault("created",
-            pod.metadata.creation_timestamp.replace(tzinfo=timezone.utc))
-
-        # 1. control‑plane scheduling
         if "scheduled" not in ts:
             evs = ev.list_namespaced_event(
                 args.namespace,
@@ -143,32 +151,20 @@ def main() -> None:
             ).items
             for e in evs:
                 if e.reason == "Scheduled":
-                    ts["scheduled"] = (e.last_timestamp or e.event_time).replace(
-                        tzinfo=timezone.utc
-                    )
+                    ts["scheduled"] = (e.last_timestamp or e.event_time).replace(tzinfo=timezone.utc)
                     break
 
-        # 2 & 3 image pull / container create events
         if {"pulling", "pulled", "created_cntr"} - ts.keys():
             for e in evs:
                 if e.reason == "Pulling" and "pulling" not in ts:
-                    ts["pulling"] = (e.last_timestamp or e.event_time).replace(
-                        tzinfo=timezone.utc
-                    )
+                    ts["pulling"] = (e.last_timestamp or e.event_time).replace(tzinfo=timezone.utc)
                 if e.reason == "Pulled" and "pulled" not in ts:
-                    ts["pulled"] = (e.last_timestamp or e.event_time).replace(
-                        tzinfo=timezone.utc
-                    )
+                    ts["pulled"] = (e.last_timestamp or e.event_time).replace(tzinfo=timezone.utc)
                 if e.reason == "Created" and "created_cntr" not in ts:
-                    ts["created_cntr"] = (e.last_timestamp or e.event_time).replace(
-                        tzinfo=timezone.utc
-                    )
+                    ts["created_cntr"] = (e.last_timestamp or e.event_time).replace(tzinfo=timezone.utc)
 
-        # container statuses
-        qp = next((cs for cs in pod.status.container_statuses
-                   if cs.name == "queue-proxy"), None)
-        uc = next((cs for cs in pod.status.container_statuses
-                   if cs.name == "user-container"), None)
+        qp = next((cs for cs in pod.status.container_statuses if cs.name == "queue-proxy"), None)
+        uc = next((cs for cs in pod.status.container_statuses if cs.name == "user-container"), None)
 
         if qp and qp.state.running and "qp_run" not in ts:
             ts["qp_run"] = qp.state.running.started_at.replace(tzinfo=timezone.utc)
@@ -180,12 +176,19 @@ def main() -> None:
         if uc and uc.ready and "user_ready" not in ts:
             ts["user_ready"] = datetime.now(timezone.utc)
 
-        # first request
         if "user_ready" in ts and "first_req" not in ts:
             if http_ok(pod.status.pod_ip):
                 ts["first_req"] = datetime.now(timezone.utc)
 
-        # Emit spans when both ends known -------------------------------
+        if "user_run" in ts and "user_ready" not in ts:
+            delta = (now - ts["user_run"]).total_seconds()
+            if delta > 15:
+                print(f"user-container still not 'Ready' after {delta:.1f}s")
+        if "user_ready" in ts and "first_req" not in ts:
+            delta = (now - ts["user_ready"]).total_seconds()
+            if delta > 15:
+                print(f"Still waiting for first request after {delta:.1f}s")
+
         def emit(name: str, a: str, b: str) -> None:
             if {a, b} <= ts.keys() and b not in done and ts[b] >= ts[a]:
                 start_ns = int(ts[a].timestamp() * 1e9)
