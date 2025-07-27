@@ -1,70 +1,91 @@
 #!/usr/bin/env python3
 """
-Fetch the last trace for SERVICE from Jaeger HTTP API and
-extract durations for these spans:
-  4. network‑warmup
-  5. runtime‑startup
-  6. app‑init
-  7. first‑request
+Fetch the most recent trace for SERVICE from Jaeger HTTP API and
+extract durations for these spans (stages 4–7):
+  4. network-warmup
+  5. runtime-startup
+  6. app-init
+  7. first-request
+
+Tries, in order:
+  1. jaeger-ui.observability.svc.cluster.local:16686
+  2. localhost:31686
+  3. --fallback-query (if provided)
 """
 
+import argparse
 import os
 import sys
+import socket
 import requests
 
-# ─── Configuration ────────────────────────────────────────────
-# Jaeger Query service inside the observability namespace
-JAEGER_QUERY_URL = os.getenv(
-    "JAEGER_QUERY_URL",
-    "http://jaeger-ui.observability.svc.cluster.local:16686"
-)
-SERVICE = os.getenv("SERVICE_NAME", "nginx")
-LIMIT = 1  # only fetch the single most recent trace
+DEFAULT_CLUSTER = "jaeger-ui.observability.svc.cluster.local:16686"
+DEFAULT_LOCAL   = "localhost:31686"
+LIMIT           = 1  # most recent trace
 
-# ─── Helpers ──────────────────────────────────────────────────
-def fetch_latest_trace():
-    """Query Jaeger for the latest trace data for SERVICE."""
-    url = f"{JAEGER_QUERY_URL}/api/traces"
-    params = {"service": SERVICE, "limit": LIMIT}
+def try_connect(host: str, port: int, timeout: float = 2.0) -> bool:
     try:
-        resp = requests.get(url, params=params, timeout=10)
-        resp.raise_for_status()
+        ip = socket.gethostbyname(host)
+        with socket.create_connection((ip, port), timeout=timeout):
+            return True
+    except Exception:
+        return False
+
+def choose_endpoint(candidates):
+    for ep in candidates:
+        if ":" not in ep:
+            continue
+        host, port = ep.split(":", 1)
+        print(f"Trying Jaeger endpoint {ep} …")
+        if try_connect(host, int(port)):
+            print(f"Using Jaeger endpoint: {ep}")
+            return ep
+        else:
+            print(f"Failed to connect to {ep}")
+    sys.exit("No reachable Jaeger endpoint found")
+
+def fetch_latest_trace(base_url: str, service: str):
+    url = f"http://{base_url}/api/traces"
+    params = {"service": service, "limit": LIMIT}
+    try:
+        r = requests.get(url, params=params, timeout=10)
+        r.raise_for_status()
     except requests.RequestException as e:
         sys.exit(f"Error querying Jaeger ({url}): {e}")
-    data = resp.json().get("data", [])
+    data = r.json().get("data", [])
     if not data:
-        sys.exit(f"No traces found in Jaeger for service '{SERVICE}'")
+        sys.exit(f"No traces found in Jaeger for service '{service}'")
     return data[0]
 
 def extract_stage(spans, name):
-    """
-    Find the span with operationName == name and return its duration in seconds.
-    Jaeger startTime/duration are in microseconds.
-    """
-    for span in spans:
-        if span.get("operationName") == name:
-            dur_us = span.get("duration", 0)
-            return dur_us / 1e6
+    for s in spans:
+        if s.get("operationName") == name:
+            return s.get("duration", 0) / 1e6
     return None
 
-# ─── Main ────────────────────────────────────────────────────
-if __name__ == "__main__":
-    trace = fetch_latest_trace()
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--fallback-query",
+                   help="Fallback Jaeger endpoint host:port")
+    p.add_argument("--service", default=os.getenv("SERVICE_NAME", "nginx"))
+    args = p.parse_args()
+
+    candidates = [DEFAULT_CLUSTER, DEFAULT_LOCAL]
+    if args.fallback_query:
+        candidates.append(args.fallback_query)
+    endpoint = choose_endpoint(candidates)
+
+    trace = fetch_latest_trace(endpoint, args.service)
     trace_id = trace.get("traceID", "<unknown>")
     spans = trace.get("spans", [])
+    print(f"Trace ID: {trace_id}, spans: {len(spans)}\n")
 
-    print(f"Trace ID: {trace_id}, Total Spans: {len(spans)}\n")
-
-    stages = [
-        "network-warmup",
-        "runtime-startup",
-        "app-init",
-        "first-request",
-    ]
-
-    for stage in stages:
-        duration = extract_stage(spans, stage)
-        if duration is None:
+    for stage in ("network-warmup", "runtime-startup", "app-init", "first-request"):
+        dur = extract_stage(spans, stage)
+        if dur is None:
             print(f"{stage:<15} NOT FOUND")
         else:
-            print(f"{stage:<15} {duration:8.3f}s")
+            print(f"{stage:<15} {dur:8.3f}s")
+
+if __name__ == "__main__":
+    main()
