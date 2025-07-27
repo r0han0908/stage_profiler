@@ -78,6 +78,7 @@ def main():
     trace = fetch_latest_trace(endpoint, args.service)
     trace_id = trace.get("traceID", "<unknown>")
     spans = trace.get("spans", [])
+
     print(f"Trace ID: {trace_id}, spans: {len(spans)}\n")
 
     for stage in ("network-warmup", "runtime-startup", "app-init", "first-request"):
