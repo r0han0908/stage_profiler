@@ -13,47 +13,47 @@ import sys
 import requests
 
 # ─── Configuration ────────────────────────────────────────────
+# Jaeger Query service inside the observability namespace
 JAEGER_QUERY_URL = os.getenv(
     "JAEGER_QUERY_URL",
-    "http://jaeger-query.observability.svc.cluster.local:16686"
+    "http://jaeger-ui.observability.svc.cluster.local:16686"
 )
 SERVICE = os.getenv("SERVICE_NAME", "nginx")
-LIMIT = 1  # fetch the most recent trace
+LIMIT = 1  # only fetch the single most recent trace
 
 # ─── Helpers ──────────────────────────────────────────────────
 def fetch_latest_trace():
+    """Query Jaeger for the latest trace data for SERVICE."""
     url = f"{JAEGER_QUERY_URL}/api/traces"
     params = {"service": SERVICE, "limit": LIMIT}
     try:
         resp = requests.get(url, params=params, timeout=10)
         resp.raise_for_status()
     except requests.RequestException as e:
-        sys.exit(f"Error querying Jaeger: {e}")
-    data = resp.json()
-    traces = data.get("data", [])
-    if not traces:
+        sys.exit(f"Error querying Jaeger ({url}): {e}")
+    data = resp.json().get("data", [])
+    if not data:
         sys.exit(f"No traces found in Jaeger for service '{SERVICE}'")
-    return traces[0]
+    return data[0]
 
-def extract_stage(span_list, name):
+def extract_stage(spans, name):
     """
-    Find a span by operationName and return (start_time_s, duration_s).
-    Jaeger returns startTime and duration in microseconds.
+    Find the span with operationName == name and return its duration in seconds.
+    Jaeger startTime/duration are in microseconds.
     """
-    for s in span_list:
-        if s.get("operationName") == name:
-            start_us = s.get("startTime", 0)
-            dur_us = s.get("duration", 0)
-            return start_us / 1e6, dur_us / 1e6
-    return None, None
+    for span in spans:
+        if span.get("operationName") == name:
+            dur_us = span.get("duration", 0)
+            return dur_us / 1e6
+    return None
 
 # ─── Main ────────────────────────────────────────────────────
 if __name__ == "__main__":
-    trace_data = fetch_latest_trace()
-    trace_id = trace_data.get("traceID", "<unknown>")
-    spans = trace_data.get("spans", [])
+    trace = fetch_latest_trace()
+    trace_id = trace.get("traceID", "<unknown>")
+    spans = trace.get("spans", [])
 
-    print(f"Found trace ID: {trace_id} with {len(spans)} spans\n")
+    print(f"Trace ID: {trace_id}, Total Spans: {len(spans)}\n")
 
     stages = [
         "network-warmup",
@@ -63,8 +63,8 @@ if __name__ == "__main__":
     ]
 
     for stage in stages:
-        start, dur = extract_stage(spans, stage)
-        if start is None:
+        duration = extract_stage(spans, stage)
+        if duration is None:
             print(f"{stage:<15} NOT FOUND")
         else:
-            print(f"{stage:<15} {dur:8.3f}s")
+            print(f"{stage:<15} {duration:8.3f}s")
