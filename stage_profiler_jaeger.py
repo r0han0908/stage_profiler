@@ -30,13 +30,16 @@ DEFAULT_JAEGER_QUERY      = "jaeger-ui.observability.svc.cluster.local:16686"
 DEFAULT_LOCAL_QUERY       = "localhost:31686"
 LIMIT                     = 1  # most recent trace
 
+
 def try_connect(host: str, port: int, timeout: float = 2.0) -> bool:
     try:
+        # Use numeric address for deterministic behavior
         ip = socket.gethostbyname(host)
         with socket.create_connection((ip, port), timeout=timeout):
             return True
     except Exception:
         return False
+
 
 def choose_endpoint(candidates):
     for ep in candidates:
@@ -51,9 +54,10 @@ def choose_endpoint(candidates):
             print(f"   cannot reach {ep}")
     sys.exit("No reachable endpoint found among: " + ", ".join(candidates))
 
-def emit_stage_spans(tracer, service, query_url):
-    svc_host = service  # assume DNS name resolves internally
-    svc_port = 80       # default HTTP port
+
+def emit_stage_spans(tracer, collector_host: str, collector_port: int, service_name: str):
+    svc_host = collector_host
+    svc_port = collector_port
     svc_url  = f"http://{svc_host}:{svc_port}/"
 
     # 1. network-warmup
@@ -68,21 +72,20 @@ def emit_stage_spans(tracer, service, query_url):
 
     # 2. runtime-startup
     with tracer.start_as_current_span("runtime-startup"):
-        # simulate runtime init (e.g. import heavy modules)
         import json
         _ = json.dumps({"warm": True})
 
     # 3. app-init
     with tracer.start_as_current_span("app-init"):
-        # simulate application initialization
         time.sleep(0.1)
 
     # 4. first-request
     with tracer.start_as_current_span("first-request"):
         try:
-            resp = requests.get(svc_url, timeout=5)
+            requests.get(svc_url, timeout=5)
         except Exception:
             pass
+
 
 def fetch_latest_trace(base_url: str, service: str):
     url    = f"http://{base_url}/api/traces"
@@ -97,21 +100,23 @@ def fetch_latest_trace(base_url: str, service: str):
         sys.exit(f"No traces found for service '{service}'")
     return data[0]
 
+
 def extract_stage(spans, name):
     for s in spans:
         if s.get("operationName") == name:
-            # Jaeger duration is in microseconds
-            return s.get("duration", 0) / 1e6
+            return s.get("duration", 0) / 1e6  # convert μs to s
     return None
 
+
 def main():
-    p = argparse.ArgumentParser()
-    p.add_argument("--fallback-collector",
-                   help="Fallback OTLP collector host:port")
-    p.add_argument("--fallback-query",
-                   help="Fallback Jaeger query host:port")
-    p.add_argument("--service", default=os.getenv("SERVICE_NAME", "nginx"))
-    args = p.parse_args()
+    parser = argparse.ArgumentParser(description="Stage profiler to emit and query spans.")
+    parser.add_argument("--fallback-collector",
+                        help="Fallback OTLP collector host:port")
+    parser.add_argument("--fallback-query",
+                        help="Fallback Jaeger query host:port")
+    parser.add_argument("--service", default=os.getenv("SERVICE_NAME", "nginx"),
+                        help="Service name for spans and queries")
+    args = parser.parse_args()
 
     # 1) Choose an OTLP collector endpoint
     coll_candidates = [DEFAULT_OTEL_COLLECTOR, DEFAULT_LOCAL_COLLECTOR]
@@ -119,7 +124,11 @@ def main():
         coll_candidates.append(args.fallback_collector)
     otlp_endpoint = choose_endpoint(coll_candidates)
 
-    # 2) Set up OpenTelemetry tracer to export to OTLP
+    # 2) Split host and port for collector
+    host, port = otlp_endpoint.split(":", 1)
+    collector_port = int(port)
+
+    # 3) Set up OpenTelemetry tracer to export to OTLP
     resource = Resource.create({OTEL_SERVICE_NAME: args.service})
     provider = TracerProvider(resource=resource)
     exporter = OTLPSpanExporter(endpoint=otlp_endpoint, insecure=True)
@@ -127,19 +136,19 @@ def main():
     trace.set_tracer_provider(provider)
     tracer = trace.get_tracer(__name__)
 
-    # 3) Emit the four “stage” spans
-    emit_stage_spans(tracer, args.service, otlp_endpoint)
+    # 4) Emit the four “stage” spans
+    emit_stage_spans(tracer, host, collector_port, args.service)
 
-    # 4) Give the collector / Jaeger a moment to ingest
+    # 5) Give the collector / Jaeger a moment to ingest
     time.sleep(5)
 
-    # 5) Choose a Jaeger query endpoint
+    # 6) Choose a Jaeger query endpoint
     query_candidates = [DEFAULT_JAEGER_QUERY, DEFAULT_LOCAL_QUERY]
     if args.fallback_query:
         query_candidates.append(args.fallback_query)
     jaeger_query = choose_endpoint(query_candidates)
 
-    # 6) Fetch and analyze the latest trace
+    # 7) Fetch and analyze the latest trace
     trace_data = fetch_latest_trace(jaeger_query, args.service)
     trace_id   = trace_data.get("traceID", "<unknown>")
     spans      = trace_data.get("spans", [])
