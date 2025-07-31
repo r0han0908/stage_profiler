@@ -1,190 +1,168 @@
-#!/usr/bin/env python3
-"""
-Resilient profiler for Knative/Kubernetes pod cold starts with OTLP fallback support.
-"""
+import os
+import logging
+import argparse
+from datetime import datetime
+from time import time
+from contextlib import contextmanager
 
-from __future__ import annotations
-import argparse, os, sys, time, urllib.request, socket
-from datetime import datetime, timezone
-from typing import Dict
+from kubernetes import client, config, watch
 
-from kubernetes import client, config as k8s_config
-from opentelemetry import trace
+from opentelemetry import trace, metrics
 from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
 from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
+from opentelemetry.sdk.metrics import MeterProvider
+from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
+from opentelemetry.exporter.otlp.proto.grpc.metric_exporter import OTLPMetricExporter
 
-# ─── Defaults ──────────────────────────────────────────────
-DEFAULT_INTERNAL_EP = "otel-collector.observability.svc.cluster.local:4317"
-DEFAULT_LOCAL_EP    = "localhost:4317"
-WARMUP_DEFAULT      = int(os.getenv("WARMUP_SECS", "10"))
-TIMEOUT_SECS        = int(os.getenv("PROFILER_TIMEOUT", "180"))
+# Configure logging
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger(__name__)
 
-# ─── Kubernetes Client Init ────────────────────────────────
-try:
-    k8s_config.load_incluster_config()
-except Exception:
-    k8s_config.load_kube_config()
-v1 = client.CoreV1Api()
-ev = client.CoreV1Api()
+# OpenTelemetry setup
+collector_endpoint = os.getenv("OTEL_COLLECTOR_ENDPOINT", "localhost:4317")
+resource = Resource(attributes={"service.name": "stage-profiler"})
 
-# ─── Helpers ────────────────────────────────────────────────
-def resolve_pod(ns: str, service: str | None, pod_prefix: str | None) -> str:
-    if pod_prefix:
-        pods = v1.list_namespaced_pod(ns).items
-        for p in pods:
-            if pod_prefix in p.metadata.name:
-                return p.metadata.name
-        sys.exit(f"No pod name containing '{pod_prefix}' found in ns '{ns}'.")
-    pods = v1.list_namespaced_pod(ns, label_selector=f"serving.knative.dev/service={service}").items
-    if not pods:
-        sys.exit(f"No pods found for service '{service}' in ns '{ns}'.")
-    return pods[0].metadata.name
+# Tracing setup
+tracer_provider = TracerProvider(resource=resource)
+trace_exporter = OTLPSpanExporter(endpoint=collector_endpoint, insecure=True)
+tracer_provider.add_span_processor(BatchSpanProcessor(trace_exporter))
+trace.set_tracer_provider(tracer_provider)
+tracer = trace.get_tracer(__name__)
 
-def http_ok(ip: str, port: int = 80, path: str = "/", tout: float = 0.3) -> bool:
+# Metrics setup
+metric_exporter = OTLPMetricExporter(endpoint=collector_endpoint, insecure=True)
+metric_reader = PeriodicExportingMetricReader(metric_exporter)
+meter_provider = MeterProvider(resource=resource, metric_readers=[metric_reader])
+metrics.set_meter_provider(meter_provider)
+meter = metrics.get_meter(__name__)
+
+# Histograms for stages 4-7
+hist_stage4 = meter.create_histogram("stage4_proxy_warmup_duration_ms", unit="ms")
+hist_stage5 = meter.create_histogram("stage5_runtime_startup_duration_ms", unit="ms")
+hist_stage6 = meter.create_histogram("stage6_app_init_duration_ms", unit="ms")
+hist_stage7 = meter.create_histogram("stage7_first_request_duration_ms", unit="ms")
+
+# State store for pods
+pod_states = {}
+
+# Helper to emit explicit spans for stages 1-3
+def emit_span(name: str, start: datetime, end: datetime, attributes: dict):
+    start_ns = int(start.timestamp() * 1e9)
+    end_ns = int(end.timestamp() * 1e9)
+    span = tracer.start_span(name, start_time=start_ns, attributes=attributes)
+    span.end(end_time=end_ns)
+    logger.info("Emitted span %s: %s → %s", name, start, end)
+
+# Context managers for stages 4-7
+@contextmanager
+def stage4_proxy_warmup(initial_delay: int, concurrency: int):
+    attrs = {"probe.initial_delay": initial_delay, "proxy.concurrency": concurrency}
+    start = time()
+    span = tracer.start_span("stage4-proxy-warmup", attributes=attrs)
     try:
-        with urllib.request.urlopen(f"http://{ip}:{port}{path}", timeout=tout) as r:
-            return 200 <= r.status < 400
-    except Exception:
-        return False
+        yield
+    finally:
+        end = time()
+        span.end()
+        duration = (end - start) * 1e3
+        hist_stage4.record(duration, attributes=attrs)
+        logger.info("Stage4 proxy warm-up: %.2fms", duration)
 
-def try_connect(host: str, port: int, timeout: int = 2) -> bool:
+@contextmanager
+def stage5_runtime_startup(runtime_language: str, jvm_flags: str = ""):
+    attrs = {"runtime.language": runtime_language, "jvm.flags": jvm_flags}
+    start = time()
+    span = tracer.start_span("stage5-runtime-startup", attributes=attrs)
     try:
-        socket.gethostbyname(host)
-        with socket.create_connection((host, port), timeout=timeout):
-            return True
+        yield
+    finally:
+        end = time()
+        span.end()
+        duration = (end - start) * 1e3
+        hist_stage5.record(duration, attributes=attrs)
+        logger.info("Stage5 runtime start-up: %.2fms", duration)
+
+@contextmanager
+def stage6_app_init(component: str):
+    attrs = {"init.component": component}
+    start = time()
+    span = tracer.start_span("stage6-app-init", attributes=attrs)
+    try:
+        yield
+    finally:
+        end = time()
+        span.end()
+        duration = (end - start) * 1e3
+        hist_stage6.record(duration, attributes=attrs)
+        logger.info("Stage6 app init (%s): %.2fms", component, duration)
+
+@contextmanager
+def stage7_first_request(http_protocol: str, db_conn_reused: bool):
+    attrs = {"http.protocol": http_protocol, "db.conn.reused": db_conn_reused}
+    start = time()
+    span = tracer.start_span("stage7-first-request", attributes=attrs)
+    try:
+        yield
+    finally:
+        end = time()
+        span.end()
+        duration = (end - start) * 1e3
+        hist_stage7.record(duration, attributes=attrs)
+        logger.info("Stage7 first request: %.2fms", duration)
+
+# Processes pod events for stages 1-3
+def process_pod_event(pod):
+    uid = pod.metadata.uid
+    state = pod_states.setdefault(uid, {})
+    name = pod.metadata.name
+    namespace = pod.metadata.namespace
+
+    # Stage 1: scheduling
+    submit = pod.metadata.creation_timestamp
+    if 'submit' not in state:
+        state['submit'] = submit
+    for cond in pod.status.conditions or []:
+        if cond.type == "PodScheduled" and cond.status == "True" and 'scheduled' not in state:
+            state['scheduled'] = cond.last_transition_time
+            emit_span("stage1-scheduling", state['submit'], state['scheduled'], {"pod": name, "ns": namespace})
+
+    # Stage 2: image pull
+    if 'scheduled' in state and 'running' not in state:
+        for c in pod.status.container_statuses or []:
+            if c.state.running:
+                state['running'] = c.state.running.started_at
+                emit_span("stage2-image-pull", state['scheduled'], state['running'], {"pod": name, "container": c.name})
+                break
+
+    # Stage 3: container init
+    if 'running' in state and 'ready' not in state:
+        for cond in pod.status.conditions or []:
+            if cond.type == "Ready" and cond.status == "True":
+                state['ready'] = cond.last_transition_time
+                emit_span("stage3-container-init", state['running'], state['ready'], {"pod": name})
+                pod_states.pop(uid, None)
+                break
+
+# Watches pods and triggers processing
+def watch_pods(ns: str, selector: str):
+    try:
+        config.load_incluster_config()
     except Exception:
-        return False
-
-def choose_otlp_endpoint(candidates: list[str]) -> str | None:
-    for ep in candidates:
-        if ":" in ep:
-            host, port = ep.split(":")
-            print(f"Trying OTLP endpoint {ep} ...")
-            if try_connect(host.strip(), int(port.strip())):
-                print(f"Using OTLP endpoint: {ep}")
-                return ep
-            else:
-                print(f"Failed to connect to {ep}")
-    print("No working OTLP endpoint found. Proceeding without exporter.")
-    return None
-
-# ─── Main ──────────────────────────────────────────────────
-def main() -> None:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--namespace", default=os.getenv("NAMESPACE", "default"))
-    ap.add_argument("--service",   default=os.getenv("SERVICE_NAME", "nginx"))
-    ap.add_argument("--pod", help="Substring to match pod names (skips label lookup)")
-    ap.add_argument("--fallback-endpoint", help="Optional OTLP endpoint to try last")
-    ap.add_argument("--warmup", type=int, default=WARMUP_DEFAULT)
-    args = ap.parse_args()
-
-    if args.warmup > 0:
-        print(f"Waiting {args.warmup}s before starting profiling ...")
-        time.sleep(args.warmup)
-
-    # OTLP endpoint check sequence
-    endpoints = [DEFAULT_INTERNAL_EP, DEFAULT_LOCAL_EP]
-    if args.fallback_endpoint:
-        endpoints.append(args.fallback_endpoint)
-    chosen_endpoint = choose_otlp_endpoint(endpoints)
-
-    pod_name = resolve_pod(args.namespace, args.service, args.pod)
-    print(f"Profiling pod: {pod_name}")
-
-    tp = TracerProvider(resource=Resource.create({
-        "service.name":      args.service,
-        "k8s.namespace":     args.namespace,
-        "k8s.pod.name":      pod_name,
-    }))
-
-    if chosen_endpoint:
-        tp.add_span_processor(
-            BatchSpanProcessor(
-                OTLPSpanExporter(endpoint=chosen_endpoint, insecure=True)
-            )
-        )
-    trace.set_tracer_provider(tp)
-    tracer = trace.get_tracer(__name__)
-
-    ts: Dict[str, datetime] = {}
-    done = set()
-    start_time = datetime.now(timezone.utc)
-
-    while True:
-        now = datetime.now(timezone.utc)
-        if (now - start_time).total_seconds() > TIMEOUT_SECS:
-            print("Timeout reached. Uncaptured stages:")
-            for key in ['scheduled', 'pulling', 'pulled', 'created_cntr',
-                        'qp_run', 'qp_ready', 'user_run', 'user_ready', 'first_req']:
-                if key not in ts:
-                    print(f"  - {key}")
-            tp.shutdown()
-            break
-
-        pod = v1.read_namespaced_pod(pod_name, args.namespace)
-        ts.setdefault("created", pod.metadata.creation_timestamp.replace(tzinfo=timezone.utc))
-
-        if "scheduled" not in ts:
-            evs = ev.list_namespaced_event(
-                args.namespace,
-                field_selector=f"involvedObject.name={pod_name},involvedObject.kind=Pod"
-            ).items
-            for e in evs:
-                if e.reason == "Scheduled":
-                    ts["scheduled"] = (e.last_timestamp or e.event_time).replace(tzinfo=timezone.utc)
-                    break
-
-        if {"pulling", "pulled", "created_cntr"} - ts.keys():
-            for e in evs:
-                if e.reason == "Pulling" and "pulling" not in ts:
-                    ts["pulling"] = (e.last_timestamp or e.event_time).replace(tzinfo=timezone.utc)
-                if e.reason == "Pulled" and "pulled" not in ts:
-                    ts["pulled"] = (e.last_timestamp or e.event_time).replace(tzinfo=timezone.utc)
-                if e.reason == "Created" and "created_cntr" not in ts:
-                    ts["created_cntr"] = (e.last_timestamp or e.event_time).replace(tzinfo=timezone.utc)
-
-        qp = next((cs for cs in pod.status.container_statuses if cs.name == "queue-proxy"), None)
-        uc = next((cs for cs in pod.status.container_statuses if cs.name == "user-container"), None)
-
-        if qp and qp.state.running and "qp_run" not in ts:
-            ts["qp_run"] = qp.state.running.started_at.replace(tzinfo=timezone.utc)
-        if qp and qp.ready and "qp_ready" not in ts:
-            ts["qp_ready"] = datetime.now(timezone.utc)
-
-        if uc and uc.state.running and "user_run" not in ts:
-            ts["user_run"] = uc.state.running.started_at.replace(tzinfo=timezone.utc)
-        if uc and uc.ready and "user_ready" not in ts:
-            ts["user_ready"] = datetime.now(timezone.utc)
-
-        if "user_ready" in ts and "first_req" not in ts:
-            if http_ok(pod.status.pod_ip):
-                ts["first_req"] = datetime.now(timezone.utc)
-
-        def emit(name: str, a: str, b: str) -> None:
-            if {a, b} <= ts.keys() and b not in done and ts[b] >= ts[a]:
-                start_ns = int(ts[a].timestamp() * 1e9)
-                end_ns   = int(ts[b].timestamp() * 1e9)
-                span = tracer.start_span(name, start_time=start_ns)
-                span.end(end_time=end_ns)
-                print(f"{name:<23} {(ts[b]-ts[a]).total_seconds():8.3f}s")
-                done.add(b)
-
-        emit("control-plane-scheduling", "created",     "scheduled")
-        emit("image-pull",               "pulling",     "pulled")
-        emit("container-creation",       "pulled",      "created_cntr")
-        emit("network-warmup",           "qp_run",      "qp_ready")
-        emit("runtime-startup",          "qp_ready",    "user_run")
-        emit("app-init",                 "user_run",    "user_ready")
-        emit("first-request",            "user_ready",  "first_req")
-
-        if len(done) == 7:
-            print("All stages captured – exiting")
-            tp.shutdown()
-            break
-
-        time.sleep(0.5)
+        config.load_kube_config()
+    v1 = client.CoreV1Api()
+    w = watch.Watch()
+    logger.info("Watching pods in %s with selector '%s'", ns, selector)
+    for ev in w.stream(v1.list_namespaced_pod, namespace=ns, label_selector=selector, timeout_seconds=0):
+        process_pod_event(ev['object'])
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="Stage profiler for Knative cold starts")
+    parser.add_argument("--namespace", default="default", help="Kubernetes namespace to watch")
+    parser.add_argument("--selector", default="", help="Label selector for target pods")
+    args = parser.parse_args()
+    try:
+        watch_pods(args.namespace, args.selector)
+    except KeyboardInterrupt:
+        logger.info("Shutting down watch, exiting...")
