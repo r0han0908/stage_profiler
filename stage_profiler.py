@@ -1,168 +1,178 @@
+#!/usr/bin/env python3
+"""
+Knative cold-start stage profiler
+---------------------------------
+Stages
+  1. scheduling
+  2. image pull / unpack
+  3. container init   (running ➜ Ready)
+  4. queue-proxy warm-up            (URL probe until 1st 200)
+  5. runtime start-up  (scheduled ➜ running)
+  6. app-level init    (Ready ➜ URL 200)
+  7. first request latency
+
+Exports spans to an OpenTelemetry Collector (OTLP/gRPC, port 4317).
+"""
+
 import os
 import logging
 import argparse
+import threading
+import time
 from datetime import datetime
-from time import time, sleep
-from contextlib import contextmanager
-from threading import Thread
 
+import requests
 from kubernetes import client, config, watch
 from opentelemetry import trace
 from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
-from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
 
-# ─── Logging & Tracing setup ───────────────────────────────────────────────────────
+# ─────────────────────────  Logging  ──────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+)
+log = logging.getLogger("stage-profiler")
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-logger = logging.getLogger(__name__)
+# ────────────────────  Helper utilities  ──────────────────────
+def _strip_suffix(text: str, suffix: str) -> str:
+    return text[:-len(suffix)] if text.endswith(suffix) else text
 
-OTLP_TRACES = os.getenv("OTEL_COLLECTOR_ENDPOINT", "http://localhost:4318/v1/traces")
-resource = Resource({"service.name": "stage-profiler"})
+def _sanitize_endpoint(ep: str) -> str:
+    """
+    Accepts:
+        'otel-collector:4317'
+        'http://otel-collector:4317'
+        'http://localhost:4318/v1/traces'
+    Returns:
+        'otel-collector:4317'   (scheme + OTLP sub-paths stripped)
+    """
+    ep = _strip_suffix(_strip_suffix(ep.strip(), "/v1/traces"), "/v1/metrics")
+    if ep.startswith(("http://", "https://")):
+        from urllib.parse import urlparse
+        ep = urlparse(ep).netloc
+    return ep or "localhost:4317"
 
-# Tracer
-tracer_provider = TracerProvider(resource=resource)
-trace_exporter = OTLPSpanExporter(endpoint=OTLP_TRACES)
-tracer_provider.add_span_processor(BatchSpanProcessor(trace_exporter))
-trace.set_tracer_provider(tracer_provider)
+def _ms(delta: float) -> str:
+    return f"{delta * 1e3:.2f} ms"
+
+# ──────────────────  OpenTelemetry setup  ─────────────────────
+collector_ep = _sanitize_endpoint(os.getenv("OTEL_COLLECTOR_ENDPOINT", "localhost:4317"))
+resource      = Resource({"service.name": "stage-profiler"})
+
+tp     = TracerProvider(resource=resource)
+export = OTLPSpanExporter(endpoint=collector_ep, insecure=True)
+tp.add_span_processor(BatchSpanProcessor(export))
+trace.set_tracer_provider(tp)
 tracer = trace.get_tracer(__name__)
 
-# ─── Context managers for stages 4–7 ───────────────────────────────────────────────
+# ───────────────  Shared state for pod watch  ─────────────────
+pod_states        = {}
+ready_event       = threading.Event()
+ready_timestamp   = None
 
-@contextmanager
-def stage4_proxy_warmup(initial_delay: int, concurrency: int):
-    attrs = {"probe.initial_delay": initial_delay, "proxy.concurrency": concurrency}
-    t0 = time()
-    span = tracer.start_span("stage4-proxy-warmup", attributes=attrs)
-    try:
-        yield
-    finally:
-        span.end()
-        dur = (time() - t0) * 1e3
-        logger.info("Stage4 proxy warm-up: %.2fms", dur)
+def emit_span(name: str, start: datetime, end: datetime):
+    dur = (end - start).total_seconds()
+    with tracer.start_span(name, start_time=int(start.timestamp() * 1e9)) as s:
+        s.end(end_time=int(end.timestamp() * 1e9))
+    log.info("%s: %s", name, _ms(dur))
 
-@contextmanager
-def stage5_runtime_startup(runtime_language: str, jvm_flags: str = ""):
-    attrs = {"runtime.language": runtime_language, "jvm.flags": jvm_flags}
-    t0 = time()
-    span = tracer.start_span("stage5-runtime-startup", attributes=attrs)
-    try:
-        yield
-    finally:
-        span.end()
-        dur = (time() - t0) * 1e3
-        logger.info("Stage5 runtime start-up: %.2fms", dur)
+# ───────────────  K8s pod event processing  ───────────────────
+def process_pod(pod):
+    global ready_timestamp
+    uid   = pod.metadata.uid
+    state = pod_states.setdefault(uid, {})
 
-@contextmanager
-def stage6_app_init(component: str):
-    attrs = {"init.component": component}
-    t0 = time()
-    span = tracer.start_span("stage6-app-init", attributes=attrs)
-    try:
-        yield
-    finally:
-        span.end()
-        dur = (time() - t0) * 1e3
-        logger.info("Stage6 app init (%s): %.2fms", component, dur)
+    # stage 1 – scheduling
+    state.setdefault("submit", pod.metadata.creation_timestamp)
+    for c in pod.status.conditions or []:
+        if c.type == "PodScheduled" and c.status == "True" and "scheduled" not in state:
+            state["scheduled"] = c.last_transition_time
+            emit_span("stage1-scheduling", state["submit"], c.last_transition_time)
 
-@contextmanager
-def stage7_first_request(http_protocol: str, db_reused: bool):
-    attrs = {"http.protocol": http_protocol, "db.conn.reused": db_reused}
-    t0 = time()
-    span = tracer.start_span("stage7-first-request", attributes=attrs)
-    try:
-        yield
-    finally:
-        span.end()
-        dur = (time() - t0) * 1e3
-        logger.info("Stage7 first request: %.2fms", dur)
-
-# ─── Helper for stages 1–3 via Kubernetes API watcher ─────────────────────────────
-
-pod_states = {}
-
-def emit_duration_span(name: str, start: datetime, end: datetime, attrs: dict):
-    dur = (end - start).total_seconds() * 1e3
-    # export span
-    s_ns = int(start.timestamp() * 1e9)
-    e_ns = int(end.timestamp() * 1e9)
-    span = tracer.start_span(name, start_time=s_ns, attributes=attrs)
-    span.end(end_time=e_ns)
-    # log only duration
-    logger.info("%s: %.2fms", name, dur)
-
-def process_pod_event(pod):
-    uid = pod.metadata.uid
-    st = pod_states.setdefault(uid, {})
-    pod_name = pod.metadata.name
-
-    # Stage 1: scheduling
-    submit = pod.metadata.creation_timestamp
-    if "submit" not in st:
-        st["submit"] = submit
-    for cond in pod.status.conditions or []:
-        if cond.type == "PodScheduled" and cond.status == "True" and "scheduled" not in st:
-            st["scheduled"] = cond.last_transition_time
-            emit_duration_span("stage1-scheduling", st["submit"], st["scheduled"], {"pod": pod_name})
-
-    # Stage 2: image pull
-    if "scheduled" in st and "running" not in st:
+    # stage 2 (& 5) – image pull / runtime start-up
+    if "scheduled" in state and "running" not in state:
         for cs in pod.status.container_statuses or []:
             if cs.state.running:
-                st["running"] = cs.state.running.started_at
-                emit_duration_span("stage2-image-pull", st["scheduled"], st["running"], {"pod": pod_name})
+                state["running"] = cs.state.running.started_at
+                emit_span("stage2-image-pull", state["scheduled"], state["running"])
+                emit_span("stage5-runtime-startup", state["scheduled"], state["running"])
                 break
 
-    # Stage 3: container init
-    if "running" in st and "ready" not in st:
-        for cond in pod.status.conditions or []:
-            if cond.type == "Ready" and cond.status == "True":
-                st["ready"] = cond.last_transition_time
-                emit_duration_span("stage3-container-init", st["running"], st["ready"], {"pod": pod_name})
-                pod_states.pop(uid, None)
-                break
+    # stage 3 – container init
+    for c in pod.status.conditions or []:
+        if c.type == "Ready" and c.status == "True" and not ready_event.is_set():
+            if "running" in state:
+                emit_span("stage3-container-init", state["running"], c.last_transition_time)
+            ready_timestamp = c.last_transition_time
+            ready_event.set()
+            break
 
 def watch_pods(namespace: str, selector: str):
     try:
         config.load_incluster_config()
-    except:
+    except Exception:
         config.load_kube_config()
-    api = client.CoreV1Api()
-    watcher = watch.Watch()
-    logger.info(f"Watching pods in {namespace} with selector '{selector}'")
-    for ev in watcher.stream(
-        api.list_namespaced_pod,
-        namespace=namespace,
-        label_selector=selector,
-        timeout_seconds=0
-    ):
-        process_pod_event(ev["object"])
+    v1 = client.CoreV1Api()
+    w  = watch.Watch()
+    log.info("Watching pods in %s with selector '%s'", namespace, selector)
+    for ev in w.stream(v1.list_namespaced_pod,
+                       namespace=namespace,
+                       label_selector=selector,
+                       timeout_seconds=0):
+        process_pod(ev["object"])
 
-# ─── MAIN ──────────────────────────────────────────────────────────────────────────
+# ────────────────  HTTP probing (stages 4 & 7)  ───────────────
+def probe(url: str):
+    # stage 4 – proxy warm-up
+    t0 = datetime.utcnow()
+    span = tracer.start_span("stage4-proxy-warmup")
+    while True:
+        try:
+            if requests.get(url, timeout=0.5).status_code == 200:
+                break
+        except requests.RequestException:
+            pass
+        time.sleep(0.1)
+    span.end()
+    log.info("stage4-proxy-warmup: %s", _ms((datetime.utcnow() - t0).total_seconds()))
 
-if __name__ == "__main__":
-    p = argparse.ArgumentParser(description="Stage profiler for Knative cold starts")
+    # stage 6 – app-level init
+    if ready_timestamp:
+        emit_span("stage6-app-init", ready_timestamp, datetime.utcnow())
+
+    # stage 7 – first request latency
+    t7 = datetime.utcnow()
+    span7 = tracer.start_span("stage7-first-request")
+    resp  = requests.get(url)
+    span7.end()
+    log.info("stage7-first-request: %s (HTTP %s)",
+             _ms((datetime.utcnow() - t7).total_seconds()), resp.status_code)
+
+# ───────────────────────────  main  ───────────────────────────
+def main():
+    p = argparse.ArgumentParser(description="Knative cold-start stage profiler")
     p.add_argument("--namespace", default=os.getenv("NAMESPACE", "default"))
-    p.add_argument("--selector", default=os.getenv("SELECTOR", ""))
+    p.add_argument("--selector",  default=os.getenv("SELECTOR", ""))
+    p.add_argument("--url", required=True,
+                   help="Full URL to the service (e.g. http://<IP>/nginx)")
     args = p.parse_args()
 
-    if not args.selector and "SERVICE_NAME" in os.environ:
-        args.selector = f"serving.knative.dev/service={os.environ['SERVICE_NAME']}"
+    if not args.selector and os.getenv("SERVICE_NAME"):
+        args.selector = f"serving.knative.dev/service={os.getenv('SERVICE_NAME')}"
 
-    # 1) Start watcher thread (daemon so it won’t block exit)
-    t = Thread(target=watch_pods, args=(args.namespace, args.selector), daemon=True)
-    t.start()
-    sleep(0.1)  # ensure its “Watching pods…” log appears first
+    threading.Thread(target=watch_pods,
+                     args=(args.namespace, args.selector),
+                     daemon=True).start()
 
-    # 2) Run stages 4–7 in order
-    with stage4_proxy_warmup(initial_delay=40, concurrency=10):
-        logger.info("Starting proxy…")
-    with stage5_runtime_startup(runtime_language="go"):
-        logger.info("Starting application runtime…")
-    with stage6_app_init(component="db-connector"):
-        logger.info("App-level init: DB connector…")
-    with stage7_first_request(http_protocol="http1.1", db_reused=False):
-        logger.info("Waiting for first request…")
+    log.info("Waiting for Pod to become Ready…")
+    if not ready_event.wait(300):
+        log.error("Timeout: Pod was not Ready within 5 min")
+        return
 
-    # Process exits here (daemon watcher thread stops automatically)
+    probe(args.url)
+
+if __name__ == "__main__":
+    main()
