@@ -1,23 +1,19 @@
 #!/usr/bin/env python3
 """
-Knative cold‑start stage profiler (runtime‑startup via OTEL span)
-----------------------------------------------------------------
+Knative cold‑start stage profiler (loops forever)
+------------------------------------------------
+Profiles every new Knative revision that appears, then waits for the next one.
 Stages
   1. scheduling               (PodSubmitted ➜ PodScheduled)
   2. image pull / unpack       (PodScheduled ➜ first container Running)
   3. container init            (Running ➜ Ready)
-  4. queue‑proxy warm‑up       (URL probe until 1st 200)
-  5. runtime start‑up          (PodScheduled ➜ **first OTEL span**) ← changed
-  6. app‑level init            (Ready ➜ URL 200)
+  4. queue‑proxy warm‑up       (URL probe until first 200)
+  5. runtime start‑up          (PodScheduled ➜ first OTEL span)
+  6. app‑level init            (Ready ➜ first 200)
   7. first‑request latency
 
-Each (pod UID, stage) is emitted exactly once so reconnects don’t duplicate
-entries.  Stage 5 now waits for the first OpenTelemetry span produced by the
-workload and measures the delta from the PodScheduled timestamp.
-
-Requires: the workload emits spans whose `service.name` is known (defaults to
-$SERVICE_NAME or `--otel-service` argument), and the collector exposes the
-Zipkin v2 API (defaults to http://jaeger-zipkin.observability.svc.cluster.local:9411).
+The script never exits: after finishing one revision it resets its state and
+waits for the next Pod that matches the selector to reach **Ready**.
 """
 
 import os
@@ -27,6 +23,7 @@ import threading
 import time
 from datetime import datetime, timezone
 from urllib.parse import urlparse, quote_plus
+from collections import defaultdict
 
 import requests
 from kubernetes import client, config, watch
@@ -41,7 +38,7 @@ logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("stage-profiler")
 
-# ───────────────────  Helpers  ─────────────────────────
+# ───────────────────  Helper functions  ──────────────────────
 
 def _strip_suffix(txt: str, suf: str) -> str:
     return txt[:-len(suf)] if txt.endswith(suf) else txt
@@ -62,13 +59,12 @@ def _utc(dt: datetime) -> datetime:
 def _ms(delta_sec: float) -> str:
     return f"{delta_sec * 1e3:.2f} ms"
 
-# ────────────────  OpenTelemetry setup  ──────────────────────
+# ───────────────────  OpenTelemetry setup  ───────────────────
 endpoint_env = (
     os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT") or
     os.getenv("OTEL_COLLECTOR_ENDPOINT") or
     "localhost:4317"
 )
-
 collector_ep = _sanitize_endpoint(endpoint_env)
 
 provider = TracerProvider(resource=Resource({"service.name": "stage-profiler"}))
@@ -78,18 +74,18 @@ provider.add_span_processor(BatchSpanProcessor(
 trace.set_tracer_provider(provider)
 tracer = trace.get_tracer(__name__)
 
-# ───────────────  Shared pod‑watch state  ───────────────────
+# ───────────────  Global mutable state  ──────────────────────
 
 pod_state: dict[str, dict] = {}
-ready_event = threading.Event()
-ready_timestamp: datetime | None = None
+ready_event  = threading.Event()
 ready_uid: str | None = None
-scheduled_timestamp: datetime | None = None
-scheduled_uid: str | None = None
+scheduled_ts: dict[str, datetime] = {}
 
-# Deduplication guard
-seen: set[tuple[str, str]] = set()
+# Dedup guards
+seen: set[tuple[str, str]] = set()          # (uid, stage)
+processed: set[str] = set()                 # pods already fully profiled
 
+# ────────────────  Span emitter  ─────────────────────────────
 
 def emit_span(name: str, start: datetime, end: datetime, uid: str):
     key = (uid, name)
@@ -100,14 +96,12 @@ def emit_span(name: str, start: datetime, end: datetime, uid: str):
     start, end = map(_utc, (start, end))
     span = tracer.start_span(name, start_time=int(start.timestamp() * 1e9))
     span.end(end_time=int(end.timestamp() * 1e9))
-    log.info("%s: %s", name, _ms((end - start).total_seconds()))
+    log.info("%s [%s]: %s", name, uid[:6], _ms((end - start).total_seconds()))
 
-# ─────────────────  OTEL‑based runtime startup  ──────────────
+# ───────────────  OTEL‑based runtime startup  ────────────────
 
 def wait_for_first_span(zipkin_base: str, otel_service: str, start_ts: datetime, uid: str):
-    """Poll Zipkin API until at least one span for the service appears."""
-    api = f"{zipkin_base.rstrip('/')}/api/v2/traces?serviceName={quote_plus(otel_service)}&limit=1&lookback=30s"
-    log.info("Waiting for first span of service '%s' via %s", otel_service, api)
+    api = f"{zipkin_base.rstrip('/')}/api/v2/traces?serviceName={quote_plus(otel_service)}&limit=1&lookback=45s"
     while True:
         try:
             r = requests.get(api, timeout=2)
@@ -118,10 +112,10 @@ def wait_for_first_span(zipkin_base: str, otel_service: str, start_ts: datetime,
             pass
         time.sleep(0.5)
 
-# ────────────────  K8s event processing  ─────────────────────
+# ───────────────  Pod event processor  ───────────────────────
 
 def process_pod(pod):
-    global ready_timestamp, ready_uid, scheduled_timestamp, scheduled_uid
+    global ready_uid
 
     uid = pod.metadata.uid
     state = pod_state.setdefault(uid, {})
@@ -131,8 +125,7 @@ def process_pod(pod):
     for cond in pod.status.conditions or []:
         if cond.type == "PodScheduled" and cond.status == "True" and "scheduled" not in state:
             state["scheduled"] = cond.last_transition_time
-            scheduled_timestamp = cond.last_transition_time
-            scheduled_uid = uid
+            scheduled_ts[uid] = cond.last_transition_time
             emit_span("stage1-scheduling", state["submit"], cond.last_transition_time, uid)
 
     # Stage 2 – image pull / unpack
@@ -143,14 +136,14 @@ def process_pod(pod):
                 emit_span("stage2-image-pull", state["scheduled"], state["running"], uid)
                 break
 
-    # Stage 3 – container init
+    # Stage 3 – container init / Ready
     for cond in pod.status.conditions or []:
-        if cond.type == "Ready" and cond.status == "True" and not ready_event.is_set():
+        if cond.type == "Ready" and cond.status == "True":
             if "running" in state:
                 emit_span("stage3-container-init", state["running"], cond.last_transition_time, uid)
-            ready_timestamp = cond.last_transition_time
-            ready_uid = uid
-            ready_event.set()
+            if uid not in processed and ready_uid != uid:
+                ready_uid = uid
+                ready_event.set()          # signal main loop
             break
 
 # ───────────────  Kubernetes watch loop  ────────────────────
@@ -173,11 +166,10 @@ def watch_pods(namespace: str, selector: str):
 
 # ─────────────  HTTP probing (stages 4, 6, 7)  ───────────────
 
-def probe(url: str):
+def probe(url: str, uid: str, ready_ts: datetime):
     # Stage 4 – proxy warm‑up
     t0 = datetime.now(timezone.utc)
     span4 = tracer.start_span("stage4-proxy-warmup", start_time=int(t0.timestamp() * 1e9))
-
     while True:
         try:
             if requests.get(url, timeout=0.5).status_code == 200:
@@ -185,58 +177,64 @@ def probe(url: str):
         except requests.RequestException:
             time.sleep(0.1)
     span4.end()
-    log.info("stage4-proxy-warmup: %s", _ms((datetime.now(timezone.utc) - t0).total_seconds()))
+    emit_span("stage4-proxy-warmup", t0, datetime.now(timezone.utc), uid)
 
-    # Stage 6 – app‑level init (Ready ➜ first 200 after Ready)
-    if ready_timestamp and ready_uid:
-        emit_span("stage6-app-init", ready_timestamp, datetime.now(timezone.utc), ready_uid)
+    # Stage 6 – app‑level init
+    emit_span("stage6-app-init", ready_ts, datetime.now(timezone.utc), uid)
 
     # Stage 7 – first request latency
     t7 = datetime.now(timezone.utc)
     span7 = tracer.start_span("stage7-first-request", start_time=int(t7.timestamp() * 1e9))
     resp = requests.get(url)
     span7.end()
-    log.info("stage7-first-request: %s (HTTP %d)",
-             _ms((datetime.now(timezone.utc) - t7).total_seconds()), resp.status_code)
+    log.info("stage7-first-request [%s]: %s (HTTP %d)", uid[:6], _ms((datetime.now(timezone.utc) - t7).total_seconds()), resp.status_code)
 
 # ────────────────────────────  main  ─────────────────────────
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Knative cold-start stage profiler")
+    parser = argparse.ArgumentParser(description="Knative cold‑start stage profiler – continuous mode")
     parser.add_argument("--namespace", default=os.getenv("NAMESPACE", "default"))
     parser.add_argument("--selector",  default=os.getenv("SELECTOR", ""))
     parser.add_argument("--url",       required=True,
-                        help="Full URL of the service (e.g. http://nginx.default.svc.cluster.local)")
+                        help="Full URL of the Route, e.g. http://nginx.default.example.com")
     parser.add_argument("--otel-service", default=os.getenv("SERVICE_NAME", ""),
                         help="service.name label emitted by the workload")
     parser.add_argument("--zipkin", default=os.getenv("ZIPKIN_API", "http://jaeger-zipkin.observability.svc.cluster.local:9411"),
                         help="Base URL of Zipkin v2 API exposed by the collector")
     args = parser.parse_args()
 
-    if not args.selector and args.otel_service:
-        args.selector = f"serving.knative.dev/service={args.otel_service}"  # heuristic
-
     if not args.otel_service:
         log.error("Need --otel-service or $SERVICE_NAME to detect first span")
         return
 
-    # spawn pod watcher
+    if not args.selector:
+        args.selector = f"serving.knative.dev/service={args.otel_service}"
+
+    # Spawn pod watcher thread
     threading.Thread(target=watch_pods,
                      args=(args.namespace, args.selector),
                      daemon=True).start()
 
-    log.info("Waiting for Pod to become Ready …")
-    if not ready_event.wait(timeout=300):
-        log.error("Timeout waiting for Ready condition")
-        return
+    log.info("Started – waiting for successive Pods to become Ready …")
 
-    # spawn watcher for first OTEL span (stage 5)
-    if scheduled_timestamp and scheduled_uid:
-        threading.Thread(target=wait_for_first_span,
-                         args=(args.zipkin, args.otel_service, scheduled_timestamp, scheduled_uid),
-                         daemon=True).start()
+    while True:
+        ready_event.wait()    # block until a new pod hits Ready
+        uid = ready_uid
+        ready_event.clear()
+        if uid in processed:
+            continue          # already handled this one (duplicate event)
+        processed.add(uid)
 
-    probe(args.url)
+        # spawn span‑watcher
+        if uid in scheduled_ts:
+            threading.Thread(target=wait_for_first_span,
+                             args=(args.zipkin, args.otel_service, scheduled_ts[uid], uid),
+                             daemon=True).start()
+
+        # run HTTP probe pipeline
+        probe(args.url, uid, pod_state[uid].get("scheduled", datetime.now(timezone.utc)))
+
+        log.info("Completed profiling of pod %s – waiting for next revision …", uid[:6])
 
 
 if __name__ == "__main__":
