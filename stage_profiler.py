@@ -192,23 +192,26 @@ def probe(url: str, uid: str, ready_ts: datetime):
 # ────────────────────────────  main  ─────────────────────────
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Knative cold‑start stage profiler – continuous mode")
+    parser = argparse.ArgumentParser(description="Knative cold-start stage profiler – continuous mode")
     parser.add_argument("--namespace", default=os.getenv("NAMESPACE", "default"))
-    parser.add_argument("--selector",  default=os.getenv("SELECTOR", ""))
+    parser.add_argument("--selector",  default=os.getenv("SELECTOR", ""),
+                        help="Label selector for pods to watch; empty = all pods in namespace")
     parser.add_argument("--url",       required=True,
                         help="Full URL of the Route, e.g. http://nginx.default.example.com")
     parser.add_argument("--otel-service", default=os.getenv("SERVICE_NAME", ""),
-                        help="service.name label emitted by the workload")
+                        help="service.name label emitted by the workload; if omitted, stage 5 is skipped")
     parser.add_argument("--zipkin", default=os.getenv("ZIPKIN_API", "http://jaeger-zipkin.observability.svc.cluster.local:9411"),
                         help="Base URL of Zipkin v2 API exposed by the collector")
     args = parser.parse_args()
 
-    if not args.otel_service:
-        log.error("Need --otel-service or $SERVICE_NAME to detect first span")
-        return
-
+    # If no selector provided, watch *all* pods in the namespace
     if not args.selector:
-        args.selector = f"serving.knative.dev/service={args.otel_service}"
+        log.warning("No --selector provided; watching every pod in namespace '%s'", args.namespace)
+        args.selector = ""  # empty selector → all pods
+
+    # If otel_service not provided, stage 5 will be skipped (still logs other stages)
+    if not args.otel_service:
+        log.info("No --otel-service specified; stage 5 (OTEL span) will be skipped")
 
     # Spawn pod watcher thread
     threading.Thread(target=watch_pods,
@@ -218,15 +221,15 @@ def main() -> None:
     log.info("Started – waiting for successive Pods to become Ready …")
 
     while True:
-        ready_event.wait()    # block until a new pod hits Ready
+        ready_event.wait()
         uid = ready_uid
         ready_event.clear()
         if uid in processed:
-            continue          # already handled this one (duplicate event)
+            continue
         processed.add(uid)
 
-        # spawn span‑watcher
-        if uid in scheduled_ts:
+        # spawn span‑watcher if we have a service name
+        if args.otel_service and uid in scheduled_ts:
             threading.Thread(target=wait_for_first_span,
                              args=(args.zipkin, args.otel_service, scheduled_ts[uid], uid),
                              daemon=True).start()
