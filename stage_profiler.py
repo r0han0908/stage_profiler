@@ -2,11 +2,9 @@
 """
 Knative cold‑start stage profiler (loops forever, auto‑detects service name)
 --------------------------------------------------------------------------
-No need to pass --otel-service manually: when the first pod of a revision
-appears the script reads its labels ("serving.knative.dev/service", fallback
-"app"/"app.kubernetes.io/name") and uses that as the OTEL service name for
-stage 5. If a span with that service.name never arrives, stage 5 is skipped but
-other stages are still reported.
+Using Kubernetes API to detect all stages including stage 5 (runtime startup).
+Stage 5 now detects when the queue-proxy reports ready and the endpoint becomes
+accessible, indicating the Knative runtime is truly ready to serve traffic.
 """
 
 import os
@@ -15,7 +13,7 @@ import argparse
 import threading
 import time
 from datetime import datetime, timezone
-from urllib.parse import urlparse, quote_plus
+from urllib.parse import urlparse
 
 import requests
 from kubernetes import client, config, watch
@@ -66,11 +64,16 @@ ready_event = threading.Event()
 ready_uid: str | None = None
 scheduled_ts = {}
 service_by_uid = {}  # detected OTEL service.name per pod UID
+queue_proxy_ready_ts = {}  # When queue-proxy becomes ready
 
 # Track which spans we've already emitted per pod
 emitted_spans = {}  # uid -> set of emitted span names
 # Track which pods we've already fully processed
 processed = set()
+
+# Kubernetes API clients
+v1_client = None  # Core API client
+serving_client = None  # Knative serving API client
 
 # ────────────────  Span emitter  ─────────────────────────────
 
@@ -87,6 +90,11 @@ def emit_span(name: str, start: datetime, end: datetime, uid: str):
     # Mark this span as emitted
     emitted_spans[uid].add(name)
     
+    # Ensure we have reasonable timestamps
+    if end <= start:
+        log.warning(f"Invalid timing for {name} [pod {uid[:6]}]: start={start}, end={end}, using 1ms")
+        end = start.replace(microsecond=start.microsecond + 1000)
+    
     # Start and end the span
     span = tracer.start_span(name, start_time=int(_utc(start).timestamp() * 1e9))
     span.end(end_time=int(_utc(end).timestamp() * 1e9))
@@ -95,37 +103,40 @@ def emit_span(name: str, start: datetime, end: datetime, uid: str):
     duration = (end - start).total_seconds()
     log.info("%s [%s]: %s", name, uid[:6], _ms(duration))
 
-# ──────────────  OTEL‑based runtime stage 5  ─────────────────
+# ──────────────  Stage 5 using K8s API  ──────────────────────
 
-def wait_for_first_span(zipkin_base: str, service: str, start_ts: datetime, uid: str):
-    """Try to find a span for the service and emit stage5 if found"""
-    if not zipkin_base.startswith(('http://', 'https://')):
-        zipkin_base = f"http://{zipkin_base}"
+def monitor_queue_proxy_ready(namespace, pod_name, uid, scheduled_time):
+    """
+    Monitor when queue-proxy container becomes ready, indicating runtime startup
+    """
+    global v1_client
     
-    api = f"{zipkin_base.rstrip('/')}/api/v2/traces?serviceName={quote_plus(service)}&limit=10&lookback=300s"
-    log.info(f"Looking for spans from service '{service}' at {api}")
+    log.info(f"Monitoring queue-proxy readiness for pod {pod_name}")
+    start_time = scheduled_time
     
-    retries = 120  # Try for ~1 minute
-    for i in range(retries):
+    # Poll for queue-proxy container status
+    for _ in range(120):  # Try for ~2 minutes
         try:
-            r = requests.get(api, timeout=5)
-            log.debug(f"Zipkin query attempt {i+1}/{retries}: status={r.status_code}, content_length={len(r.text)}")
+            pod = v1_client.read_namespaced_pod(pod_name, namespace)
             
-            if r.ok and r.json():
-                traces = r.json()
-                span_count = sum(len(span) for trace in traces for span in trace)
-                log.info(f"Found {span_count} spans for service '{service}'")
-                emit_span("stage5-runtime-startup", start_ts, datetime.now(timezone.utc), uid)
-                return True
-        except requests.RequestException as e:
-            log.warning(f"Zipkin request failed (attempt {i+1}/{retries}): {e}")
+            # Check container statuses
+            if pod.status.container_statuses:
+                for container in pod.status.container_statuses:
+                    if container.name == "queue-proxy" and container.ready:
+                        # Queue proxy is ready!
+                        end_time = datetime.now(timezone.utc)
+                        log.info(f"Queue proxy is ready in pod {pod_name}")
+                        
+                        # Record timestamp and emit span
+                        queue_proxy_ready_ts[uid] = end_time
+                        emit_span("stage5-runtime-startup", start_time, end_time, uid)
+                        return True
         except Exception as e:
-            log.warning(f"Error processing Zipkin response (attempt {i+1}/{retries}): {e}")
+            log.warning(f"Error checking queue-proxy status: {e}")
         
-        if i < retries - 1:  # Don't sleep on the last iteration
-            time.sleep(0.5)
+        time.sleep(1)
     
-    log.warning(f"No span for service '{service}' after {retries} attempts; skipping stage5 for {uid[:6]}")
+    log.warning(f"Queue proxy never became ready for pod {pod_name}, skipping stage5")
     return False
 
 # ───────────────  Pod event processor  ───────────────────────
@@ -140,6 +151,8 @@ def process_pod(pod):
     """Process pod updates and emit spans for detected state changes"""
     global ready_uid
     uid = pod.metadata.uid
+    pod_name = pod.metadata.name
+    namespace = pod.metadata.namespace
     
     with pod_lock:  # Thread-safe access to pod_state
         state = pod_state.setdefault(uid, {"emitted": set()})
@@ -167,7 +180,7 @@ def process_pod(pod):
         # Stage 2 - Image Pull
         if "scheduled" in state:
             for cs in pod.status.container_statuses or []:
-                if cs.state and cs.state.running:
+                if cs.name == "user-container" and cs.state and cs.state.running:
                     state["running"] = cs.state.running.started_at
                     
                     # Only emit stage2 once
@@ -186,6 +199,15 @@ def process_pod(pod):
                     emitted.add("stage3")
                     emit_span("stage3-container-init", state["running"], c.last_transition_time, uid)
                 
+                # Start stage5 monitoring in a background thread
+                if "stage5" not in emitted and "scheduled" in state:
+                    threading.Thread(
+                        target=monitor_queue_proxy_ready,
+                        args=(namespace, pod_name, uid, scheduled_ts[uid]),
+                        daemon=True
+                    ).start()
+                    emitted.add("stage5")  # Mark as started to prevent duplicates
+                
                 # Signal that this pod is ready for probing
                 if uid not in processed and ready_uid != uid:
                     ready_uid = uid
@@ -194,8 +216,10 @@ def process_pod(pod):
 
 # ───────────────  Kubernetes watch loop  ────────────────────
 
-def watch_pods(ns: str, selector: str):
-    """Watch for pod events in the specified namespace with the given selector"""
+def setup_kubernetes_clients():
+    """Set up Kubernetes API clients"""
+    global v1_client, serving_client
+    
     try:
         config.load_incluster_config()
         log.info("Using in-cluster Kubernetes configuration")
@@ -203,13 +227,21 @@ def watch_pods(ns: str, selector: str):
         config.load_kube_config()
         log.info("Using local Kubernetes configuration")
     
-    v1 = client.CoreV1Api()
+    v1_client = client.CoreV1Api()
+    
+    # No need for serving_client as we're using direct pod monitoring for stage 5
+
+def watch_pods(ns: str, selector: str):
+    """Watch for pod events in the specified namespace with the given selector"""
+    global v1_client
+    
+    setup_kubernetes_clients()
     w = watch.Watch()
     
     while True:
         try:
             log.info(f"Watching pods in {ns} selector='{selector or '<all>'}'")
-            for ev in w.stream(v1.list_namespaced_pod, namespace=ns, 
+            for ev in w.stream(v1_client.list_namespaced_pod, namespace=ns, 
                                label_selector=selector, timeout_seconds=120):
                 process_pod(ev["object"])
         except Exception as e:
@@ -262,17 +294,18 @@ def probe(url: str, uid: str, ready_ts: datetime):
 # ────────────────────────────  main  ─────────────────────────
 
 def main() -> None:
-    p = argparse.ArgumentParser("Knative cold‑start profiler – auto service detection")
+    p = argparse.ArgumentParser("Knative cold‑start profiler – K8s API based monitoring")
     p.add_argument("--namespace", default=os.getenv("NAMESPACE", "default"))
     p.add_argument("--selector", default=os.getenv("SELECTOR", ""), help="Label selector; blank = all pods")
     p.add_argument("--url", required=True, help="Route URL to probe (e.g. http://nginx.default)")
-    p.add_argument("--zipkin", default=os.getenv("ZIPKIN_API", "http://jaeger-zipkin.observability.svc.cluster.local:9411"))
-    p.add_argument("--otel-service", default=os.getenv("SERVICE_NAME", ""), help="Override detected service name")
     p.add_argument("--debug", action="store_true", help="Enable debug logging")
     args = p.parse_args()
 
     if args.debug:
         logging.getLogger("stage-profiler").setLevel(logging.DEBUG)
+
+    # Set up Kubernetes API clients
+    setup_kubernetes_clients()
 
     # Start the pod watcher in a separate thread
     watcher_thread = threading.Thread(
@@ -298,24 +331,17 @@ def main() -> None:
             # Mark this pod as processed
             processed.add(uid)
             
-            # Get the service name (prefer command line arg, then detected)
-            svc_name = args.otel_service or service_by_uid.get(uid)
+            # Get the service name from detection
+            svc_name = service_by_uid.get(uid)
+            if svc_name:
+                log.info(f"Processing pod {uid[:6]} for service '{svc_name}'")
+            else:
+                log.warning(f"No service name detected for pod {uid[:6]}")
             
             # Get the ready timestamp for this pod
             pod_ready_ts = pod_state[uid].get("ready", pod_state[uid].get("scheduled", datetime.now(timezone.utc)))
 
-        # Start stage5 check in a separate thread if we have a service name
-        if svc_name and uid in scheduled_ts:
-            log.info(f"Starting stage5 check for service '{svc_name}', pod {uid[:6]}")
-            threading.Thread(
-                target=wait_for_first_span,
-                args=(args.zipkin, svc_name, scheduled_ts[uid], uid),
-                daemon=True
-            ).start()
-        else:
-            log.warning(f"No service name detected for pod {uid[:6]} – skipping stage5")
-
-        # Probe the URL for stages 4, 6, and 7
+        # Probe the URL for stages 4, 6, and 7 (stage 5 is handled by the queue-proxy monitor)
         probe(args.url, uid, pod_ready_ts)
         log.info(f"Completed pod {uid[:6]} – awaiting next revision...")
 
