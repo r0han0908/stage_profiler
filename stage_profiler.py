@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """
-Knative cold-start stage profiler — profiles every new pod
-----------------------------------------------------------
-Derives all seven stages from the Kubernetes API; Stage 5 ends when the
-queue-proxy container reports Ready.  Prints a neat table after each pod.
+Knative cold-start stage profiler — profiles **every** new pod
+--------------------------------------------------------------
+• Derives all seven stages from the Kubernetes API.
+• Stage 5 ends when the queue-proxy container becomes Ready.
+• Prints a formatted table after each pod.
+• The watcher never stops: if the API-server closes the stream, it reconnects.
 """
 
 import os, logging, argparse, threading, time
@@ -14,41 +16,48 @@ from urllib.parse import urlparse
 import requests
 from kubernetes import client, config, watch
 from opentelemetry import trace
+from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
 from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
-from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
 
 
-# ─────────── Logging ───────────
+# ─────────────  Logging  ─────────────
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("stage-profiler")
 
-# ─────────── Helpers ───────────
+
+# ─────────────  Helpers  ─────────────
 def _sanitize(endpoint: str) -> str:
     endpoint = endpoint.rstrip("/v1/traces").rstrip("/v1/metrics").strip()
     return urlparse(endpoint).netloc if endpoint.startswith(("http://", "https://")) else endpoint
 
+
 def _utc(dt):
     return dt.astimezone(timezone.utc) if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
+
 def _ms(sec): return f"{sec*1e3:.2f} ms"
 
-# ─────────── OpenTelemetry (profiler spans) ───────────
-collector_ep = _sanitize(os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT")
-                         or os.getenv("OTEL_COLLECTOR_ENDPOINT")
-                         or "localhost:4317")
+
+# ─────── OpenTelemetry for profiler’s own spans ───────
+collector_ep = _sanitize(os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT") or
+                         os.getenv("OTEL_COLLECTOR_ENDPOINT") or
+                         "localhost:4317")
+
 tp = TracerProvider(resource=Resource({"service.name": "stage-profiler"}))
-tp.add_span_processor(BatchSpanProcessor(OTLPSpanExporter(endpoint=collector_ep, insecure=True)))
+tp.add_span_processor(BatchSpanProcessor(
+    OTLPSpanExporter(endpoint=collector_ep, insecure=True)))
 trace.set_tracer_provider(tp)
 tracer = trace.get_tracer(__name__)
 
-# ─────────── Global state ───────────
+
+# ─────────────  Global state  ─────────────
 pod_state, pod_timings = {}, {}
 pod_lock = threading.Lock()
 ready_event = threading.Event()
-ready_uid = None
+ready_uid: str | None = None
 processed = set()
 service_by_uid = {}
 
@@ -64,7 +73,8 @@ STAGES = OrderedDict([
 
 v1: client.CoreV1Api  # set later
 
-# ─────────── Span + timing helpers ───────────
+
+# ─────────────  Span + timing helpers  ─────────────
 def emit_span(stage, start, end, uid):
     span = tracer.start_span(stage, start_time=int(_utc(start).timestamp()*1e9))
     span.end(end_time=int(_utc(end).timestamp()*1e9))
@@ -73,12 +83,14 @@ def emit_span(stage, start, end, uid):
         pod_timings.setdefault(uid, {})[stage] = (start, end, dur_ms)
     log.info("%s [%s]: %s", STAGES.get(stage, stage), uid[:6], _ms(dur_ms/1000))
 
+
 def print_table(uid):
     timings = pod_timings.get(uid)
     if not timings:
         return
     svc = service_by_uid.get(uid, "unknown")
-    total = (timings["stage7-first-request"][1] - timings["stage1-scheduling"][0]).total_seconds()*1000
+    total = (timings["stage7-first-request"][1] -
+             timings["stage1-scheduling"][0]).total_seconds()*1000
     print("\n┏" + "━"*70 + "┓")
     print(f"┃ {'COLD START PROFILE':^68} ┃")
     print(f"┃ Pod {uid[:8]}  Service {svc:<20} {'':>24} ┃")
@@ -87,29 +99,35 @@ def print_table(uid):
     print("┠" + "─"*30 + "┼" + "─"*18 + "┼" + "─"*15 + "┨")
     for sid, label in STAGES.items():
         if sid in timings:
-            _, _, d = timings[sid]
-            pct = d/total*100 if total else 0
-            print(f"┃ {label:30} │ {_ms(d/1000):18} │ {pct:13.1f}% ┃")
+            _, _, ms = timings[sid]
+            pct = ms/total*100 if total else 0
+            print(f"┃ {label:30} │ {_ms(ms/1000):18} │ {pct:13.1f}% ┃")
     print("┗" + "━"*70 + "┛\n")
 
-# ─────────── Stage 5 monitor (queue-proxy) ───────────
+
+# ─────────────  Stage-5 monitor (queue-proxy)  ─────────────
 def monitor_qproxy(ns, pod_name, uid, sched_ts):
     for _ in range(120):
         try:
             pod = v1.read_namespaced_pod(pod_name, ns)
             for cs in pod.status.container_statuses or []:
                 if cs.name == "queue-proxy" and cs.ready:
-                    emit_span("stage5-runtime-startup", sched_ts, datetime.now(timezone.utc), uid)
+                    emit_span("stage5-runtime-startup", sched_ts,
+                              datetime.now(timezone.utc), uid)
                     return
         except Exception:
             pass
         time.sleep(1)
     log.warning("queue-proxy never Ready for %s; skipping stage5", uid[:6])
 
-# ─────────── Pod event processing ───────────
+
+# ─────────────  Pod event processing  ─────────────
 def _svc_name(pod):
     lbl = pod.metadata.labels or {}
-    return lbl.get("serving.knative.dev/service") or lbl.get("app.kubernetes.io/name") or lbl.get("app")
+    return (lbl.get("serving.knative.dev/service")
+            or lbl.get("app.kubernetes.io/name")
+            or lbl.get("app"))
+
 
 def process_pod(pod):
     global ready_uid
@@ -119,15 +137,15 @@ def process_pod(pod):
     st = pod_state.setdefault(uid, {})
     st.setdefault("submit", pod.metadata.creation_timestamp)
 
-    # stage1
+    # Stage 1
     for c in pod.status.conditions or []:
         if c.type == "PodScheduled" and c.status == "True" and "scheduled" not in st:
             st["scheduled"] = c.last_transition_time
             emit_span("stage1-scheduling", st["submit"], c.last_transition_time, uid)
-            if svc := _svc_name(pod):
+            if (svc := _svc_name(pod)):
                 service_by_uid[uid] = svc
 
-    # stage2
+    # Stage 2
     if "scheduled" in st and "running" not in st:
         for cs in pod.status.container_statuses or []:
             if cs.state and cs.state.running:
@@ -135,20 +153,23 @@ def process_pod(pod):
                 emit_span("stage2-image-pull", st["scheduled"], st["running"], uid)
                 break
 
-    # stage3
+    # Stage 3
     for c in pod.status.conditions or []:
         if c.type == "Ready" and c.status == "True":
             if "ready" not in st and "running" in st:
                 st["ready"] = c.last_transition_time
                 emit_span("stage3-container-init", st["running"], c.last_transition_time, uid)
+
                 threading.Thread(target=monitor_qproxy,
                                  args=(ns, name, uid, st["scheduled"]),
                                  daemon=True).start()
+
                 ready_uid = uid
                 ready_event.set()
             break
 
-# ─────────── K8s watch loop ───────────
+
+# ─────────────  Kubernetes watch loop (robust)  ─────────────
 def setup_k8s():
     global v1
     try:
@@ -157,15 +178,28 @@ def setup_k8s():
         config.load_kube_config()
     v1 = client.CoreV1Api()
 
-def watch_pods(ns, sel):
-    setup_k8s()
-    w = watch.Watch()
-    for ev in w.stream(v1.list_namespaced_pod, namespace=ns,
-                       label_selector=sel or "", timeout_seconds=120):
-        process_pod(ev["object"])
 
-# ─────────── HTTP probe (4/6/7) ───────────
+def watch_pods(ns, selector):
+    """Re-establish the watch forever if the stream ends or errors out."""
+    setup_k8s()
+    while True:
+        w = watch.Watch()
+        try:
+            for ev in w.stream(v1.list_namespaced_pod,
+                               namespace=ns,
+                               label_selector=selector or "",
+                               timeout_seconds=0):   # no server-side timeout
+                process_pod(ev["object"])
+        except Exception as exc:
+            log.warning("pod watch closed (%s) – reconnect in 2 s", exc)
+            time.sleep(2)
+        finally:
+            w.stop()               # ensure socket closes before next loop
+
+
+# ─────────────  HTTP probe (Stages 4/6/7)  ─────────────
 def probe(url, uid, ready_ts):
+    # Stage 4
     t0 = datetime.now(timezone.utc)
     for _ in range(60):
         try:
@@ -176,8 +210,11 @@ def probe(url, uid, ready_ts):
         time.sleep(0.5)
     t4_end = datetime.now(timezone.utc)
     emit_span("stage4-proxy-warmup", t0, t4_end, uid)
+
+    # Stage 6
     emit_span("stage6-app-init", ready_ts, t4_end, uid)
 
+    # Stage 7
     t7 = datetime.now(timezone.utc)
     try:
         status = requests.get(url, timeout=5).status_code
@@ -186,14 +223,15 @@ def probe(url, uid, ready_ts):
     emit_span("stage7-first-request", t7, datetime.now(timezone.utc), uid)
     log.info("First request HTTP status: %s", status)
 
-# ─────────── main ───────────
+
+# ─────────────  main  ─────────────
 def main():
     ap = argparse.ArgumentParser("Cold-start profiler (every pod)")
     ap.add_argument("--namespace", default=os.getenv("NAMESPACE", "default"))
     ap.add_argument("--selector",  default=os.getenv("SELECTOR", ""),
                     help="Label selector (blank = all pods)")
     ap.add_argument("--url",       required=True,
-                    help="Route URL, e.g. http://nginx.default")
+                    help="Route URL to probe (e.g. http://nginx.default)")
     args = ap.parse_args()
 
     threading.Thread(target=watch_pods,
@@ -209,11 +247,20 @@ def main():
         if uid in processed:
             continue
         processed.add(uid)
+
         st = pod_state[uid]
         ready_ts = st.get("ready") or st.get("scheduled") or datetime.now(timezone.utc)
         probe(args.url, uid, ready_ts)
+
+        # Wait until Stage-5 span appears or 120 s elapse
+        deadline = time.time() + 120
+        while ("stage5-runtime-startup" not in pod_timings.get(uid, {})
+               and time.time() < deadline):
+            time.sleep(0.5)
+
         print_table(uid)
         log.info("Done with pod %s — waiting for next Ready pod …", uid[:6])
+
 
 if __name__ == "__main__":
     main()
