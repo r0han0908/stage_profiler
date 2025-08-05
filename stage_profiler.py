@@ -64,17 +64,11 @@ ready_event = threading.Event()
 ready_uid: str | None = None
 scheduled_ts = {}
 service_by_uid = {}  # detected OTEL service.name per pod UID
-queue_proxy_ready_ts = {}  # When queue-proxy becomes ready
 
-# Track which spans we've already emitted per pod
-emitted_spans = {}  # uid -> set of emitted span names
-# Track which pods we've already fully processed
+# Track which pods we've already processed
 processed = set()
 
-# Kubernetes API client
-v1_client = None  # Core API client
-
-# Stage timing collector
+# Track timing data for pretty printing
 pod_timings = {}  # uid -> {stage_name: (start_time, end_time, duration_ms)}
 
 # Stage names and descriptions for pretty printing
@@ -88,25 +82,33 @@ STAGES = OrderedDict([
     ("stage7-first-request", "First Request")
 ])
 
-# ────────────────  Span collection and emission  ─────────────
+# Kubernetes API client
+v1_client = None
 
-def record_timing(uid: str, stage: str, start: datetime, end: datetime):
-    """Record stage timing for later ordered emission"""
+# ────────────────  Span emitter  ─────────────────────────────
+
+def emit_span(name: str, start: datetime, end: datetime, uid: str):
+    """Emit a span and record timing data"""
+    # Ensure we have reasonable timestamps
+    if end <= start:
+        log.warning(f"Invalid timing for {name} [pod {uid[:6]}]: start={start}, end={end}, using 1ms")
+        end = start.replace(microsecond=start.microsecond + 1000)
+    
+    # Start and end the span
+    span = tracer.start_span(name, start_time=int(_utc(start).timestamp() * 1e9))
+    span.end(end_time=int(_utc(end).timestamp() * 1e9))
+    
+    # Calculate and record duration
+    duration = (end - start).total_seconds()
+    
+    # Store timing data for later printing
     with pod_lock:
         if uid not in pod_timings:
             pod_timings[uid] = {}
-        
-        # Calculate duration in ms
-        duration_ms = (end - start).total_seconds() * 1000
-        
-        # Store timing data (start, end, duration in ms)
-        pod_timings[uid][stage] = (start, end, duration_ms)
-        log.debug(f"Recorded timing for {stage} [pod {uid[:6]}]: {_ms(duration_ms/1000)}")
-
-def emit_span_to_otel(name: str, start: datetime, end: datetime):
-    """Emit a single span to OpenTelemetry"""
-    span = tracer.start_span(name, start_time=int(_utc(start).timestamp() * 1e9))
-    span.end(end_time=int(_utc(end).timestamp() * 1e9))
+        pod_timings[uid][name] = (start, end, duration * 1000)  # Store ms
+    
+    # Log immediately too
+    log.info("%s [%s]: %s", STAGES.get(name, name), uid[:6], _ms(duration))
 
 def print_profile_results(uid: str):
     """Print profile results in a nicely formatted table"""
@@ -145,9 +147,6 @@ def print_profile_results(uid: str):
                 # Calculate percentage of total time
                 percentage = (duration_ms / total_ms * 100) if total_ms > 0 else 0
                 
-                # Emit to OpenTelemetry
-                emit_span_to_otel(stage_id, timings[stage_id][0], timings[stage_id][1])
-                
                 # Print formatted row
                 print(f"┃ {stage_name:30} │ {_ms(duration_ms/1000):18} │ {percentage:13.1f}% ┃")
         
@@ -160,12 +159,10 @@ def print_profile_results(uid: str):
 # ──────────────  Stage 5 using K8s API  ──────────────────────
 
 def monitor_queue_proxy_ready(namespace, pod_name, uid, scheduled_time):
-    """
-    Monitor when queue-proxy container becomes ready, indicating runtime startup
-    """
+    """Monitor when queue-proxy container becomes ready, indicating runtime startup"""
     global v1_client
     
-    log.debug(f"Monitoring queue-proxy readiness for pod {pod_name}")
+    log.info(f"Monitoring queue-proxy readiness for pod {pod_name}")
     start_time = scheduled_time
     
     # Poll for queue-proxy container status
@@ -179,10 +176,10 @@ def monitor_queue_proxy_ready(namespace, pod_name, uid, scheduled_time):
                     if container.name == "queue-proxy" and container.ready:
                         # Queue proxy is ready!
                         end_time = datetime.now(timezone.utc)
-                        log.debug(f"Queue proxy is ready in pod {pod_name}")
+                        log.info(f"Queue proxy is ready in pod {pod_name}")
                         
-                        # Record timing data
-                        record_timing(uid, "stage5-runtime-startup", start_time, end_time)
+                        # Record timestamp and emit span
+                        emit_span("stage5-runtime-startup", start_time, end_time, uid)
                         return True
         except Exception as e:
             log.warning(f"Error checking queue-proxy status: {e}")
@@ -201,35 +198,27 @@ def _detect_service_name(pod) -> str | None:
 
 
 def process_pod(pod):
-    """Process pod updates and record stage timings"""
+    """Process pod updates and emit spans for detected state changes"""
     global ready_uid
     uid = pod.metadata.uid
     pod_name = pod.metadata.name
     namespace = pod.metadata.namespace
     
-    # Debug info
-    log.debug(f"Processing pod {pod_name} (uid: {uid[:6] if uid else 'None'}), phase: {pod.status.phase}")
-    
-    # Skip if already processed
+    # Skip if already fully processed
     if uid in processed:
         return
     
     with pod_lock:  # Thread-safe access to pod_state
-        state = pod_state.setdefault(uid, {"emitted": set()})
-        emitted = state["emitted"]  # Set of stages already emitted for this pod
+        state = pod_state.setdefault(uid, {})
 
         # Stage 1 - Scheduling
         state.setdefault("submit", pod.metadata.creation_timestamp)
         
         for c in pod.status.conditions or []:
-            if c.type == "PodScheduled" and c.status == "True":
+            if c.type == "PodScheduled" and c.status == "True" and "scheduled" not in state:
                 state["scheduled"] = c.last_transition_time
                 scheduled_ts[uid] = c.last_transition_time
-                
-                # Only emit stage1 once
-                if "stage1" not in emitted:
-                    emitted.add("stage1")
-                    record_timing(uid, "stage1-scheduling", state["submit"], c.last_transition_time)
+                emit_span("stage1-scheduling", state["submit"], c.last_transition_time, uid)
                 
                 # Auto-detect service name once we schedule
                 if uid not in service_by_uid:
@@ -237,15 +226,15 @@ def process_pod(pod):
                         service_by_uid[uid] = svc
                         log.info(f"Detected service.name '{svc}' for pod {uid[:6]}")
 
-        # Stage 2 - Image Pull (ORIGINAL LOGIC) - Check ANY container that's running
+        # Stage 2 - Image Pull (ORIGINAL LOGIC) - any container running
         if "scheduled" in state and "running" not in state:
             for cs in pod.status.container_statuses or []:
                 if cs.state and cs.state.running:
                     state["running"] = cs.state.running.started_at
-                    record_timing(uid, "stage2-image-pull", state["scheduled"], state["running"])
+                    emit_span("stage2-image-pull", state["scheduled"], state["running"], uid)
                     break
 
-        # Stage 3 - Container Init & Ready
+        # Stage 3 - Container Init & Ready (ORIGINAL LOGIC)
         for c in pod.status.conditions or []:
             if c.type == "Ready" and c.status == "True":
                 if "ready" not in state:
@@ -253,20 +242,22 @@ def process_pod(pod):
                     
                     # Original logic for stage3
                     if "running" in state:
-                        record_timing(uid, "stage3-container-init", state["running"], c.last_transition_time)
+                        emit_span("stage3-container-init", state["running"], c.last_transition_time, uid)
                     
-                    # Start stage5 monitoring in a background thread if not already started
-                    if "stage5_started" not in state and "scheduled" in state:
-                        threading.Thread(
+                    # Start stage5 monitoring in a background thread
+                    if "stage5_thread" not in state and "scheduled" in state:
+                        thread = threading.Thread(
                             target=monitor_queue_proxy_ready,
                             args=(namespace, pod_name, uid, scheduled_ts[uid]),
                             daemon=True
-                        ).start()
-                        state["stage5_started"] = True
+                        )
+                        thread.start()
+                        state["stage5_thread"] = thread
                     
                     # Signal that this pod is ready for probing
-                    ready_uid = uid
-                    ready_event.set()
+                    if uid not in processed and ready_uid != uid:
+                        ready_uid = uid
+                        ready_event.set()
                 break
 
 # ───────────────  Kubernetes watch loop  ────────────────────
@@ -285,52 +276,35 @@ def setup_kubernetes_clients():
     v1_client = client.CoreV1Api()
 
 def watch_pods(ns: str, selector: str):
-    """Watch for pod events using both polling and watch"""
+    """Watch for pod events in the specified namespace with the given selector"""
     global v1_client
     
     setup_kubernetes_clients()
+    w = watch.Watch()
     
-    # Track pods we've seen to detect new ones
-    known_pods = set()
+    # First check existing pods
+    try:
+        existing_pods = v1_client.list_namespaced_pod(namespace=ns, label_selector=selector)
+        if existing_pods.items:
+            log.info(f"Found {len(existing_pods.items)} existing pods")
+            for pod in existing_pods.items:
+                log.info(f"Processing existing pod: {pod.metadata.name}")
+                process_pod(pod)
+    except Exception as e:
+        log.error(f"Error checking existing pods: {e}")
     
+    # Now watch for new pods
     while True:
         try:
-            # AGGRESSIVE POLLING: List all pods every 2 seconds
-            log.debug(f"Polling for pods in {ns} with selector '{selector}'")
-            
-            pod_list = v1_client.list_namespaced_pod(namespace=ns, label_selector=selector)
-            
-            # Track newly found pods
-            found_pods = set()
-            
-            if pod_list.items:
-                log.debug(f"Found {len(pod_list.items)} pods in poll")
-                for pod in pod_list.items:
-                    pod_id = pod.metadata.uid
-                    found_pods.add(pod_id)
-                    
-                    # If this is a new pod we haven't processed
-                    if pod_id not in known_pods:
-                        known_pods.add(pod_id)
-                        log.info(f"NEW POD DETECTED: {pod.metadata.name} (uid: {pod_id[:6]})")
-                        process_pod(pod)
-            else:
-                log.debug(f"No pods found matching selector '{selector}' in namespace {ns}")
-                
-                # Occasionally list ALL pods in namespace to help debug
-                if time.time() % 30 < 2:  # Every ~30 seconds
-                    all_pods = v1_client.list_namespaced_pod(namespace=ns)
-                    log.info(f"Total pods in namespace {ns}: {len(all_pods.items)}")
-                    for pod in all_pods.items:
-                        labels = pod.metadata.labels or {}
-                        label_str = ", ".join(f"{k}={v}" for k, v in labels.items())
-                        log.info(f"  Pod: {pod.metadata.name}, Labels: {label_str}")
-        
+            log.info(f"Watching pods in {ns} selector='{selector or '<all>'}'")
+            for ev in w.stream(v1_client.list_namespaced_pod, namespace=ns, 
+                               label_selector=selector, timeout_seconds=120):
+                pod = ev["object"]
+                log.info(f"Pod event: {ev['type']} - {pod.metadata.name}")
+                process_pod(pod)
         except Exception as e:
-            log.error(f"Error polling pods: {e}")
-        
-        # Sleep for a short time between polls
-        time.sleep(2)
+            log.error(f"Error in pod watch loop: {e}")
+            time.sleep(5)  # Wait before reconnecting
 
 # ─────────────  HTTP probing (4,6,7)  ───────────────────────
 
@@ -349,17 +323,17 @@ def probe(url: str, uid: str, ready_ts: datetime):
                 break
         except requests.RequestException as e:
             if attempt % 10 == 0:  # Log less frequently to reduce spam
-                log.debug(f"Probe attempt {attempt+1}/{max_attempts}: {e}")
+                log.info(f"Probe attempt {attempt+1}/{max_attempts}: {e}")
         
         if attempt == max_attempts - 1:
             log.warning(f"URL {url} not ready after {max_attempts} attempts")
         time.sleep(0.5)
     
     t4_end = datetime.now(timezone.utc)
-    record_timing(uid, "stage4-proxy-warmup", t0, t4_end)
+    emit_span("stage4-proxy-warmup", t0, t4_end, uid)
 
     # Stage 6 - App Init (from pod ready to first successful probe)
-    record_timing(uid, "stage6-app-init", ready_ts, t4_end)
+    emit_span("stage6-app-init", ready_ts, t4_end, uid)
 
     # Stage 7 - First Request
     t7 = datetime.now(timezone.utc)
@@ -372,16 +346,16 @@ def probe(url: str, uid: str, ready_ts: datetime):
         log.warning(f"Error in stage7 request: {e}")
         status = -1
     
-    record_timing(uid, "stage7-first-request", t7, t7_end)
-    log.debug(f"Recorded stage7 for [{uid[:6]}]: {_ms((t7_end-t7).total_seconds())} (HTTP {status})")
+    emit_span("stage7-first-request", t7, t7_end, uid)
+    log.info(f"First request HTTP status: {status}")
     
-    # Print the final profile results
+    # Print the profile results
     print_profile_results(uid)
 
 # ────────────────────────────  main  ─────────────────────────
 
 def main() -> None:
-    p = argparse.ArgumentParser("Knative cold‑start profiler – Ordered output")
+    p = argparse.ArgumentParser("Knative cold‑start profiler – K8s API based monitoring")
     p.add_argument("--namespace", default=os.getenv("NAMESPACE", "default"))
     p.add_argument("--selector", default=os.getenv("SELECTOR", ""), help="Label selector; blank = all pods")
     p.add_argument("--url", required=True, help="Route URL to probe (e.g. http://nginx.default)")
@@ -416,11 +390,11 @@ def main() -> None:
         uid = ready_uid
         ready_event.clear()
         
-        # Skip if we've already processed this pod
-        if uid in processed:
-            continue
-        
         with pod_lock:
+            # Skip if we've already processed this pod
+            if uid in processed:
+                continue
+            
             # Mark this pod as processed
             processed.add(uid)
             
@@ -428,7 +402,7 @@ def main() -> None:
             pod_ready_ts = pod_state[uid].get("ready", pod_state[uid].get("scheduled", datetime.now(timezone.utc)))
         
         # Probe the URL for stages 4, 6, and 7
-        probe(args.url, uid, pod_ready_ts)
+        probe(url, uid, pod_ready_ts)
         log.info(f"Completed pod {uid[:6]} – awaiting next revision...")
 
 
