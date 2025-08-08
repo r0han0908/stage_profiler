@@ -2,8 +2,8 @@
 """
 Knative cold-start stage profiler — profiles **every** new pod
 --------------------------------------------------------------
-• No required arguments. Defaults: namespace=default, selector=serving.knative.dev/service
-• Auto-discovers the Knative service name from pod labels and probes:
+• Requires user args: --namespace and --selector. --url is optional.
+• If --url is omitted, auto-discovers the Knative service URL as:
   http://{service}.{namespace}.svc.cluster.local
 • Derives all seven stages from the Kubernetes API.
 • Stage 5 ends when the queue-proxy container becomes Ready.
@@ -56,7 +56,7 @@ tracer = trace.get_tracer(__name__)
 pod_state, pod_timings = {}, {}
 pod_lock = threading.Lock()
 ready_event = threading.Event()
-ready_uid: str | None = None
+ready_uid = None  # type: str | None
 processed = set()
 service_by_uid = {}
 
@@ -209,11 +209,21 @@ def probe(url, uid, ready_ts):
 # ───────  main  ───────
 def main():
     ap = argparse.ArgumentParser("Cold-start profiler (every pod)")
-    ap.add_argument("--namespace", default=os.getenv("NAMESPACE", "default"))
-    ap.add_argument("--selector",  default=os.getenv("SELECTOR", "serving.knative.dev/service"),
-                    help="Label selector (blank = all pods)")
-    ap.add_argument("--url",       default=os.getenv("URL"),
-                    help="Route URL to probe; if omitted, auto-discovers from Knative service")
+    ap.add_argument(
+        "--namespace",
+        required=True,
+        help="Namespace to watch (e.g., default)"
+    )
+    ap.add_argument(
+        "--selector",
+        required=True,
+        help="Label selector to filter pods (e.g., 'serving.knative.dev/service=httpbin')"
+    )
+    ap.add_argument(
+        "--url",
+        required=False,
+        help="Route URL to probe; if omitted, auto-discovered from Knative service"
+    )
     args = ap.parse_args()
 
     # Start pod watcher (non-blocking)
@@ -221,7 +231,7 @@ def main():
                      args=(args.namespace, args.selector),
                      daemon=True).start()
     log.info("Profiler running in ns=%s selector='%s' (URL=%s)",
-             args.namespace, args.selector or "<all>", args.url or "<auto>")
+             args.namespace, args.selector, args.url or "<auto>")
 
     while True:
         ready_event.wait()
@@ -234,7 +244,7 @@ def main():
         st = pod_state.get(uid, {})
         ready_ts = st.get("ready") or st.get("scheduled") or datetime.now(timezone.utc)
 
-        # Determine probe URL: explicit > env > auto from Knative service label
+        # Determine probe URL: explicit > auto from Knative service label
         probe_url = args.url
         if not probe_url:
             svc = service_by_uid.get(uid)
