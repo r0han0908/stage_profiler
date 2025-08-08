@@ -2,9 +2,7 @@
 """
 Knative cold-start stage profiler — profiles **every** new pod
 --------------------------------------------------------------
-• Requires user args: --namespace and --selector. --url is optional.
-• If --url is omitted, auto-discovers the Knative service URL as:
-  http://{service}.{namespace}.svc.cluster.local
+• Robust detection: initial LIST + WATCH from resourceVersion (handles ADDED & MODIFIED).
 • Derives all seven stages from the Kubernetes API.
 • Stage 5 ends when the queue-proxy container becomes Ready.
 • Prints a formatted table after each pod.
@@ -25,30 +23,26 @@ from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
 
 # ────────────  Logging  ────────────
-logging.basicConfig(level=logging.INFO,
+level = os.getenv("LOGLEVEL", "INFO").upper()
+logging.basicConfig(level=getattr(logging, level, logging.INFO),
                     format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("stage-profiler")
-
-# ────────────  Helpers  ────────────
-start_time = datetime.now(timezone.utc)
-
-def _sanitize(endpoint: str) -> str:
-    endpoint = endpoint.rstrip("/v1/traces").rstrip("/v1/metrics").strip()
-    return urlparse(endpoint).netloc if endpoint.startswith(("http://", "https://")) else endpoint
 
 def _utc(dt):
     return dt.astimezone(timezone.utc) if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
 def _ms(sec): return f"{sec*1e3:.2f} ms"
 
+def _sanitize(endpoint: str) -> str:
+    endpoint = (endpoint or "").rstrip("/v1/traces").rstrip("/v1/metrics").strip()
+    return urlparse(endpoint).netloc if endpoint.startswith(("http://", "https://")) else endpoint
+
 # ────── OpenTelemetry for profiler’s own spans ──────
 collector_ep = _sanitize(os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT") or
                          os.getenv("OTEL_COLLECTOR_ENDPOINT") or
                          "localhost:4317")
-
 tp = TracerProvider(resource=Resource({"service.name": "stage-profiler"}))
-tp.add_span_processor(BatchSpanProcessor(
-    OTLPSpanExporter(endpoint=collector_ep, insecure=True)))
+tp.add_span_processor(BatchSpanProcessor(OTLPSpanExporter(endpoint=collector_ep, insecure=True)))
 trace.set_tracer_provider(tp)
 tracer = trace.get_tracer(__name__)
 
@@ -86,8 +80,7 @@ def print_table(uid):
     if not timings:
         return
     svc = service_by_uid.get(uid, "unknown")
-    total = (timings["stage7-first-request"][1] -
-             timings["stage1-scheduling"][0]).total_seconds()*1000
+    total = (timings["stage7-first-request"][1] - timings["stage1-scheduling"][0]).total_seconds()*1000
     print("\n\u250f" + "━"*70 + "┓")
     print(f"┃ {'COLD START PROFILE':^68} ┃")
     print(f"┃ Pod {uid[:8]}  Service {svc:<20} {'':>24} ┃")
@@ -106,10 +99,9 @@ def monitor_qproxy(ns, pod_name, uid, sched_ts):
     for _ in range(120):
         try:
             pod = v1.read_namespaced_pod(pod_name, ns)
-            for cs in pod.status.container_statuses or []:
+            for cs in (pod.status.container_statuses or []):
                 if cs.name == "queue-proxy" and cs.ready:
-                    emit_span("stage5-runtime-startup", sched_ts,
-                              datetime.now(timezone.utc), uid)
+                    emit_span("stage5-runtime-startup", sched_ts, datetime.now(timezone.utc), uid)
                     return
         except Exception:
             pass
@@ -126,30 +118,37 @@ def _svc_name(pod):
 def process_pod(pod):
     global ready_uid
     uid, name, ns = pod.metadata.uid, pod.metadata.name, pod.metadata.namespace
-    if uid in processed or pod.metadata.creation_timestamp < start_time:
+    if uid in processed:
         return
+
+    log.info("Saw pod %s in %s (phase=%s)", name, ns, pod.status.phase)
+
     st = pod_state.setdefault(uid, {"namespace": ns, "name": name})
     st.setdefault("submit", pod.metadata.creation_timestamp)
 
-    for c in pod.status.conditions or []:
+    # Stage 1: PodScheduled -> True
+    for c in (pod.status.conditions or []):
         if c.type == "PodScheduled" and c.status == "True" and "scheduled" not in st:
             st["scheduled"] = c.last_transition_time
             emit_span("stage1-scheduling", st["submit"], c.last_transition_time, uid)
             if (svc := _svc_name(pod)):
                 service_by_uid[uid] = svc
 
+    # Stage 2: first container running timestamp
     if "scheduled" in st and "running" not in st:
-        for cs in pod.status.container_statuses or []:
+        for cs in (pod.status.container_statuses or []):
             if cs.state and cs.state.running:
                 st["running"] = cs.state.running.started_at
                 emit_span("stage2-image-pull", st["scheduled"], st["running"], uid)
                 break
 
-    for c in pod.status.conditions or []:
-        if c.type == "Ready" and c.status == "True":
+    # Stage 3: Pod Ready / ContainersReady
+    for c in (pod.status.conditions or []):
+        if c.type in ("Ready", "ContainersReady") and c.status == "True":
             if "ready" not in st and "running" in st:
                 st["ready"] = c.last_transition_time
                 emit_span("stage3-container-init", st["running"], c.last_transition_time, uid)
+                # stage 5 watcher
                 threading.Thread(target=monitor_qproxy,
                                  args=(ns, name, uid, st["scheduled"]),
                                  daemon=True).start()
@@ -162,22 +161,42 @@ def setup_k8s():
     global v1
     try:
         config.load_incluster_config()
+        log.info("Loaded in-cluster config")
     except Exception:
         config.load_kube_config()
+        log.info("Loaded kubeconfig")
     v1 = client.CoreV1Api()
 
 def watch_pods(ns, selector):
     setup_k8s()
+
+    # 1) Initial LIST (prime + get resourceVersion)
+    resp = v1.list_namespaced_pod(ns, label_selector=selector or "")
+    log.info("Initial list: %d pod(s) matched selector '%s'", len(resp.items), selector or "<all>")
+    for p in resp.items:
+        process_pod(p)
+    rv = resp.metadata.resource_version
+
+    # 2) WATCH from that resourceVersion
     while True:
         w = watch.Watch()
         try:
-            for ev in w.stream(v1.list_namespaced_pod,
-                               namespace=ns,
-                               label_selector=selector or "",
-                               timeout_seconds=0):
-                if ev["type"] != "ADDED":
+            for ev in w.stream(
+                v1.list_namespaced_pod,
+                namespace=ns,
+                label_selector=selector or "",
+                resource_version=rv,
+                timeout_seconds=300,
+                allow_watch_bookmarks=True,
+            ):
+                et = ev["type"]
+                obj = ev["object"]
+                if et == "BOOKMARK":
+                    rv = obj.metadata.resource_version
                     continue
-                process_pod(ev["object"])
+                rv = obj.metadata.resource_version
+                if et in ("ADDED", "MODIFIED"):
+                    process_pod(obj)
         except Exception as exc:
             log.warning("pod watch closed (%s) – reconnect in 2 s", exc)
             time.sleep(2)
@@ -209,24 +228,14 @@ def probe(url, uid, ready_ts):
 # ───────  main  ───────
 def main():
     ap = argparse.ArgumentParser("Cold-start profiler (every pod)")
-    ap.add_argument(
-        "--namespace",
-        required=True,
-        help="Namespace to watch (e.g., default)"
-    )
-    ap.add_argument(
-        "--selector",
-        required=True,
-        help="Label selector to filter pods (e.g., 'serving.knative.dev/service=httpbin')"
-    )
-    ap.add_argument(
-        "--url",
-        required=False,
-        help="Route URL to probe; if omitted, auto-discovered from Knative service"
-    )
+    ap.add_argument("--namespace", required=True,
+                    help="Namespace to watch (e.g., default)")
+    ap.add_argument("--selector", required=True,
+                    help="Label selector (e.g., 'serving.knative.dev/service=httpbin')")
+    ap.add_argument("--url", required=False,
+                    help="Route URL to probe; if omitted, auto-discovers from Knative service")
     args = ap.parse_args()
 
-    # Start pod watcher (non-blocking)
     threading.Thread(target=watch_pods,
                      args=(args.namespace, args.selector),
                      daemon=True).start()
@@ -261,7 +270,7 @@ def main():
             except Exception as e:
                 log.warning("Probe failed for %s: %s", uid[:6], e)
 
-        # Wait up to 120s for stage 5 to appear (queue-proxy ready)
+        # Wait up to 120s for stage 5 to be recorded (queue-proxy ready)
         deadline = time.time() + 120
         while ("stage5-runtime-startup" not in pod_timings.get(uid, {})
                and time.time() < deadline):
