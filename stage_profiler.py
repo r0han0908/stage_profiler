@@ -2,17 +2,18 @@
 """
 Knative cold-start stage profiler — profiles **every** new pod
 --------------------------------------------------------------
+• No required arguments. Defaults: namespace=default, selector=serving.knative.dev/service
+• Auto-discovers the Knative service name from pod labels and probes:
+  http://{service}.{namespace}.svc.cluster.local
 • Derives all seven stages from the Kubernetes API.
 • Stage 5 ends when the queue-proxy container becomes Ready.
 • Prints a formatted table after each pod.
 • The watcher never stops: if the API-server closes the stream, it reconnects.
 """
 
-from datetime import datetime, timezone
-start_time = datetime.now(timezone.utc)  # Capture early
-
 import os, logging, argparse, threading, time
 from collections import OrderedDict
+from datetime import datetime, timezone
 from urllib.parse import urlparse
 
 import requests
@@ -29,6 +30,8 @@ logging.basicConfig(level=logging.INFO,
 log = logging.getLogger("stage-profiler")
 
 # ────────────  Helpers  ────────────
+start_time = datetime.now(timezone.utc)
+
 def _sanitize(endpoint: str) -> str:
     endpoint = endpoint.rstrip("/v1/traces").rstrip("/v1/metrics").strip()
     return urlparse(endpoint).netloc if endpoint.startswith(("http://", "https://")) else endpoint
@@ -85,12 +88,12 @@ def print_table(uid):
     svc = service_by_uid.get(uid, "unknown")
     total = (timings["stage7-first-request"][1] -
              timings["stage1-scheduling"][0]).total_seconds()*1000
-    print("\n┏" + "━"*70 + "┓")
+    print("\n\u250f" + "━"*70 + "┓")
     print(f"┃ {'COLD START PROFILE':^68} ┃")
     print(f"┃ Pod {uid[:8]}  Service {svc:<20} {'':>24} ┃")
     print("┣" + "━"*70 + "┫")
     print(f"┃ {'Stage':^30} │ {'Duration':^18} │ {'% Total':^15} ┃")
-    print("┠" + "─"*30 + "┼" + "─"*18 + "┼" + "─"*15 + "┨")
+    print("┣" + "━"*30 + "╋" + "━"*18 + "╋" + "━"*15 + "┫")
     for sid, label in STAGES.items():
         if sid in timings:
             _, _, ms = timings[sid]
@@ -123,12 +126,9 @@ def _svc_name(pod):
 def process_pod(pod):
     global ready_uid
     uid, name, ns = pod.metadata.uid, pod.metadata.name, pod.metadata.namespace
-
-    # Only allow profiling for new pods created after profiler started
     if uid in processed or pod.metadata.creation_timestamp < start_time:
         return
-
-    st = pod_state.setdefault(uid, {})
+    st = pod_state.setdefault(uid, {"namespace": ns, "name": name})
     st.setdefault("submit", pod.metadata.creation_timestamp)
 
     for c in pod.status.conditions or []:
@@ -210,17 +210,18 @@ def probe(url, uid, ready_ts):
 def main():
     ap = argparse.ArgumentParser("Cold-start profiler (every pod)")
     ap.add_argument("--namespace", default=os.getenv("NAMESPACE", "default"))
-    ap.add_argument("--selector",  default=os.getenv("SELECTOR", ""),
+    ap.add_argument("--selector",  default=os.getenv("SELECTOR", "serving.knative.dev/service"),
                     help="Label selector (blank = all pods)")
-    ap.add_argument("--url",       required=True,
-                    help="Route URL to probe (e.g. http://nginx.default)")
+    ap.add_argument("--url",       default=os.getenv("URL"),
+                    help="Route URL to probe; if omitted, auto-discovers from Knative service")
     args = ap.parse_args()
 
+    # Start pod watcher (non-blocking)
     threading.Thread(target=watch_pods,
                      args=(args.namespace, args.selector),
                      daemon=True).start()
-    log.info("Profiler running in ns=%s selector='%s'",
-             args.namespace, args.selector or "<all>")
+    log.info("Profiler running in ns=%s selector='%s' (URL=%s)",
+             args.namespace, args.selector or "<all>", args.url or "<auto>")
 
     while True:
         ready_event.wait()
@@ -230,10 +231,27 @@ def main():
             continue
         processed.add(uid)
 
-        st = pod_state[uid]
+        st = pod_state.get(uid, {})
         ready_ts = st.get("ready") or st.get("scheduled") or datetime.now(timezone.utc)
-        probe(args.url, uid, ready_ts)
 
+        # Determine probe URL: explicit > env > auto from Knative service label
+        probe_url = args.url
+        if not probe_url:
+            svc = service_by_uid.get(uid)
+            ns = st.get("namespace", args.namespace)
+            if svc:
+                probe_url = f"http://{svc}.{ns}.svc.cluster.local"
+                log.info("Auto-discovered probe URL: %s", probe_url)
+            else:
+                log.warning("No service label found for pod %s; skipping HTTP probe", uid[:6])
+
+        if probe_url:
+            try:
+                probe(probe_url, uid, ready_ts)
+            except Exception as e:
+                log.warning("Probe failed for %s: %s", uid[:6], e)
+
+        # Wait up to 120s for stage 5 to appear (queue-proxy ready)
         deadline = time.time() + 120
         while ("stage5-runtime-startup" not in pod_timings.get(uid, {})
                and time.time() < deadline):
@@ -241,7 +259,6 @@ def main():
 
         print_table(uid)
         log.info("Done with pod %s — waiting for next Ready pod …", uid[:6])
-
 
 if __name__ == "__main__":
     main()
