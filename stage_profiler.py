@@ -1,26 +1,29 @@
 #!/usr/bin/env python3
 """
-Knative cold-start stage profiler
----------------------------------
+Knative cold-start stage profiler (+ wake-from-zero)
+----------------------------------------------------
 • Profiles every new pod (robust LIST + WATCH).
 • Derives all seven stages from the Kubernetes API.
 • Stage 5 ends when the queue-proxy container becomes Ready.
-• Prints a formatted table after each pod.
 • If API-server closes the stream, it reconnects.
+• Structured logs:
+  - logs/stage_timings.ndjson   (append-only history; one JSON object per profile)
+  - logs/latest_and_best.json   (always holds {"current": ..., "best_overall": ...})
 
-Structured logs:
-• logs/stage_timings.ndjson       (append-only history; one JSON object per profile)
-• logs/latest_and_best.json       (always holds {"current": ..., "best_overall": ...})
-
-New:
-• --periodic-coldstart-every-minutes N (default 20): every N minutes, delete one current
-  pod matching --selector to force a new cold start, which will be profiled & logged.
+New (wake-from-zero):
+• If no pods match the selector (e.g., minScale=0), the profiler sends an HTTP
+  request to the service URL to trigger scale-from-zero so a pod boots and is
+  then monitored.
+• Controls:
+  --wake-when-zero / --no-wake-when-zero
+  --wake-interval-seconds 15
+  --wake-retries 3
 """
 
-import os, json, logging, argparse, threading, time, pathlib, random
+import os, json, logging, argparse, threading, time, pathlib, random, re
 from collections import OrderedDict
 from datetime import datetime, timezone
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlencode
 
 import requests
 from kubernetes import client, config, watch
@@ -238,7 +241,6 @@ def process_pod(pod):
             if "ready" not in st and "running" in st:
                 st["ready"] = c.last_transition_time
                 emit_span("stage3-container-init", st["running"], c.last_transition_time, uid)
-                # stage 5 watcher
                 threading.Thread(target=monitor_qproxy,
                                  args=(ns, name, uid, st["scheduled"]),
                                  daemon=True).start()
@@ -257,11 +259,14 @@ def setup_k8s():
         log.info("Loaded kubeconfig")
     v1 = client.CoreV1Api()
 
+def list_matching_pods(ns: str, selector: str):
+    return v1.list_namespaced_pod(ns, label_selector=selector or "")
+
 def watch_pods(ns, selector):
     setup_k8s()
 
     # 1) Initial LIST
-    resp = v1.list_namespaced_pod(ns, label_selector=selector or "")
+    resp = list_matching_pods(ns, selector)
     log.info("Initial list: %d pod(s) matched selector '%s'", len(resp.items), selector or "<all>")
     for p in resp.items:
         process_pod(p)
@@ -293,7 +298,7 @@ def watch_pods(ns, selector):
         finally:
             w.stop()
 
-# ───────  HTTP probe (Stages 4/6/7)  ───────
+# ───────  Probe helpers (Stages 4/6/7 + wake)  ───────
 def probe(url, uid, ready_ts, kind: str = "coldstart"):
     t0 = datetime.now(timezone.utc)
     for _ in range(60):
@@ -315,54 +320,122 @@ def probe(url, uid, ready_ts, kind: str = "coldstart"):
     emit_span("stage7-first-request", t7, datetime.now(timezone.utc), uid)
     log.info("[%s] First request HTTP status: %s", kind, status)
 
-# ───────  Periodic cold-start trigger (delete a pod)  ───────
-def periodic_coldstart(ns: str, selector: str, period_sec: int, jitter_sec: int = 10):
+def _extract_knative_service_from_selector(selector: str) -> str | None:
+    """
+    Return service name if selector contains 'serving.knative.dev/service=<name>'.
+    """
+    if not selector:
+        return None
+    # split on commas not inside quotes (simple case)
+    parts = [p.strip() for p in selector.split(",")]
+    for p in parts:
+        if p.startswith("serving.knative.dev/service="):
+            return p.split("=", 1)[1]
+    return None
+
+def _build_probe_url(ns: str, selector: str, explicit_url: str | None) -> str | None:
+    if explicit_url:
+        return explicit_url
+    svc = _extract_knative_service_from_selector(selector)
+    if svc:
+        return f"http://{svc}.{ns}.svc.cluster.local"
+    return None
+
+def wake_service(url: str, retries: int, interval_s: int):
+    """
+    Send a few HTTP GETs (with random query to bypass caches) to trigger
+    Knative scale-from-zero via the activator.
+    """
+    if not url:
+        log.info("[wake] no URL to wake")
+        return
+    for i in range(max(1, retries)):
+        try:
+            q = {"wake": int(time.time()), "r": random.randint(0, 1_000_000)}
+            sep = "&" if "?" in url else "?"
+            target = f"{url}{sep}{urlencode(q)}"
+            log.info("[wake] hitting %s (attempt %d/%d)", target, i+1, retries)
+            requests.get(target, timeout=5)
+        except requests.RequestException as e:
+            log.debug("[wake] request error: %s", e)
+        if i < retries - 1:
+            time.sleep(interval_s)
+
+# ───────  Periodic cold-start trigger (delete a pod or wake if zero)  ───────
+def periodic_coldstart(ns: str, selector: str, period_sec: int, wake_url: str | None,
+                       wake_retries: int, wake_interval_s: int, jitter_sec: int = 10):
     """
     Every 'period_sec', delete one running pod matching 'selector' in 'ns'.
-    The watcher will see the new pod and profile it as a cold start.
-    Requires RBAC to delete pods in 'ns'.
+    If none are present (scaled to zero), send wake requests to 'wake_url'.
+    Requires RBAC to delete pods in 'ns' for the delete path.
     """
     if period_sec <= 0:
         return
     setup_k8s()
-    # First wait a tiny bit so we don't clash immediately with start-up
     time.sleep(min(5, period_sec))
     while True:
         try:
-            pods = v1.list_namespaced_pod(ns, label_selector=selector or "")
+            pods = list_matching_pods(ns, selector)
             candidates = [p for p in pods.items if (p.status.phase in ("Running", "Pending"))]
             if not candidates:
-                log.info("[periodic] No pods found for selector='%s' in ns=%s", selector, ns)
+                log.info("[periodic] no pods to delete; likely scaled to zero — sending wake")
+                wake_service(wake_url, retries=wake_retries, interval_s=wake_interval_s)
             else:
                 victim = random.choice(candidates)
                 log.info("[periodic] Deleting pod %s to force cold start …", victim.metadata.name)
                 try:
                     v1.delete_namespaced_pod(victim.metadata.name, ns, grace_period_seconds=0)
                 except ApiException as e:
-                    # 404/409 are common if it disappeared between list & delete
                     log.warning("[periodic] Failed to delete pod %s: %s", victim.metadata.name, e)
         except Exception as e:
             log.warning("[periodic] Error during periodic cold start: %s", e)
 
-        # Sleep period with small jitter to avoid alignment with other jobs
         sleep_s = period_sec + random.randint(0, max(1, jitter_sec))
         time.sleep(sleep_s)
 
+# ───────  Zero-watcher: wake when there are zero pods  ───────
+def zero_watcher(ns: str, selector: str, wake_url: str | None,
+                 wake_enabled: bool, wake_interval_s: int, wake_retries: int):
+    if not wake_enabled:
+        return
+    setup_k8s()
+    # small stagger
+    time.sleep(3)
+    while True:
+        try:
+            pods = list_matching_pods(ns, selector)
+            cnt = len(pods.items)
+            if cnt == 0:
+                log.info("[zero] 0 pods for selector='%s' — sending wake", selector)
+                wake_service(wake_url, retries=wake_retries, interval_s=wake_interval_s)
+        except Exception as e:
+            log.warning("[zero] error checking pod count: %s", e)
+        time.sleep(wake_interval_s)
+
 # ───────  main  ───────
 def main():
-    ap = argparse.ArgumentParser("Cold-start profiler (every pod + periodic cold starts)")
+    ap = argparse.ArgumentParser("Cold-start profiler (every pod + periodic cold starts + wake-from-zero)")
     ap.add_argument("--namespace", required=True,
                     help="Namespace to watch (e.g., default)")
     ap.add_argument("--selector", required=True,
                     help="Label selector (e.g., 'serving.knative.dev/service=httpbin')")
     ap.add_argument("--url", required=False,
-                    help="Route URL to probe; if omitted, auto-discovers from Knative service")
+                    help="Route URL to probe/wake; if omitted, tries 'http://<ksvc>.<ns>.svc.cluster.local' from selector")
     ap.add_argument("--logs-dir", default="logs",
                     help="Directory to write logs (default: ./logs)")
     ap.add_argument("--reprobe-every", type=int, default=0,
                     help="If >0, periodically re-probe the same URL (steady-state) and log entries as kind='reprobe' every N seconds (NOT a cold start).")
     ap.add_argument("--periodic-coldstart-every-minutes", type=int, default=20,
-                    help="If >0, every N minutes delete a current pod matching --selector to force a new cold start that will be profiled.")
+                    help="If >0, every N minutes delete a current pod; if none, wake the service to trigger a new cold start.")
+    # wake-from-zero controls
+    ap.add_argument("--wake-when-zero", dest="wake_when_zero", action="store_true", default=True,
+                    help="Send requests to wake the service when no pods are present (default: on)")
+    ap.add_argument("--no-wake-when-zero", dest="wake_when_zero", action="store_false",
+                    help="Disable wake-from-zero behavior")
+    ap.add_argument("--wake-interval-seconds", type=int, default=15,
+                    help="Seconds between wake attempts/checks when zero pods are present (default: 15)")
+    ap.add_argument("--wake-retries", type=int, default=3,
+                    help="Number of wake HTTP attempts per wake cycle (default: 3)")
     args = ap.parse_args()
 
     # Prepare file paths
@@ -371,23 +444,37 @@ def main():
     HISTORY_LOG = str(logs_path / "stage_timings.ndjson")
     BEST_CURRENT_JSON = str(logs_path / "latest_and_best.json")
 
+    # Compute a wake/probe URL usable even when scaled to zero
+    wake_probe_url = _build_probe_url(args.namespace, args.selector, args.url)
+    if wake_probe_url:
+        log.info("Wake/Probe URL: %s", wake_probe_url)
+    else:
+        log.warning("No wake/probe URL could be derived. Provide --url or include serving.knative.dev/service=<name> in --selector.")
+
     # Start the watch thread
     threading.Thread(target=watch_pods,
                      args=(args.namespace, args.selector),
                      daemon=True).start()
 
-    # Start the periodic cold-start thread
+    # Start the periodic cold-start thread (delete or wake)
     period_sec = max(0, args.periodic_coldstart_every_minutes) * 60
     if period_sec > 0:
         threading.Thread(target=periodic_coldstart,
-                         args=(args.namespace, args.selector, period_sec),
+                         args=(args.namespace, args.selector, period_sec, wake_probe_url,
+                               args.wake_retries, args.wake_interval_seconds),
                          daemon=True).start()
         log.info("Periodic cold-start enabled: every %d minutes", args.periodic_coldstart_every_minutes)
     else:
         log.info("Periodic cold-start disabled")
 
+    # Start zero watcher (wake when 0 pods)
+    threading.Thread(target=zero_watcher,
+                     args=(args.namespace, args.selector, wake_probe_url,
+                           args.wake_when_zero, args.wake_interval_seconds, args.wake_retries),
+                     daemon=True).start()
+
     log.info("Profiler running in ns=%s selector='%s' (URL=%s)",
-             args.namespace, args.selector, args.url or "<auto>")
+             args.namespace, args.selector, wake_probe_url or "<none>")
 
     # Optional steady-state re-probe loop state
     next_reprobe_at = 0
@@ -407,16 +494,10 @@ def main():
                 st = pod_state.get(uid, {})
                 ready_ts = st.get("ready") or st.get("scheduled") or datetime.now(timezone.utc)
 
-                # Determine probe URL: explicit > auto from Knative service label
-                probe_url = args.url
+                # Determine probe URL: explicit > derived (works when scaled up)
+                probe_url = wake_probe_url
                 if not probe_url:
-                    svc = service_by_uid.get(uid)
-                    ns = st.get("namespace", args.namespace)
-                    if svc:
-                        probe_url = f"http://{svc}.{ns}.svc.cluster.local"
-                        log.info("Auto-discovered probe URL: %s", probe_url)
-                    else:
-                        log.warning("No service label found for pod %s; skipping HTTP probe", uid[:6])
+                    log.warning("No probe URL; skipping HTTP probe for pod %s", uid[:6])
 
                 if probe_url:
                     try:
