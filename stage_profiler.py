@@ -541,7 +541,7 @@ def main():
     ap.add_argument("--logs-dir", default="logs", help="Directory to write logs (default: ./logs)")
     ap.add_argument("--reprobe-every", type=int, default=0,
                     help="If >0, periodically re-probe the same URL (steady-state) and log entries as kind='reprobe' every N seconds (NOT a cold start).")
-    ap.add_argument("--periodic-coldstart-every-minutes", type=int, default=20,
+    ap.add_argument("--periodic-coldstart-every-minutes", type=int, default=10,
                     help="If >0, every N minutes delete a current pod; if none, wake the service to trigger a new cold start.")
     # wake-from-zero controls
     ap.add_argument("--wake-when-zero", dest="wake_when_zero", action="store_true", default=True,
