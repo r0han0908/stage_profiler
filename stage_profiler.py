@@ -1,21 +1,31 @@
 #!/usr/bin/env python3
 """
-Knative cold-start stage profiler — profiles **every** new pod
---------------------------------------------------------------
-• Robust detection: initial LIST + WATCH from resourceVersion (handles ADDED & MODIFIED).
+Knative cold-start stage profiler
+---------------------------------
+• Profiles every new pod (robust LIST + WATCH).
 • Derives all seven stages from the Kubernetes API.
 • Stage 5 ends when the queue-proxy container becomes Ready.
 • Prints a formatted table after each pod.
-• The watcher never stops: if the API-server closes the stream, it reconnects.
+• If API-server closes the stream, it reconnects.
+
+Structured logs:
+• logs/stage_timings.ndjson       (append-only history; one JSON object per profile)
+• logs/latest_and_best.json       (always holds {"current": ..., "best_overall": ...})
+
+New:
+• --periodic-coldstart-every-minutes N (default 20): every N minutes, delete one current
+  pod matching --selector to force a new cold start, which will be profiled & logged.
 """
 
-import os, logging, argparse, threading, time
+import os, json, logging, argparse, threading, time, pathlib, random
 from collections import OrderedDict
 from datetime import datetime, timezone
 from urllib.parse import urlparse
 
 import requests
 from kubernetes import client, config, watch
+from kubernetes.client.rest import ApiException
+
 from opentelemetry import trace
 from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
 from opentelemetry.sdk.resources import Resource
@@ -30,8 +40,8 @@ log = logging.getLogger("stage-profiler")
 
 def _utc(dt):
     return dt.astimezone(timezone.utc) if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
-
 def _ms(sec): return f"{sec*1e3:.2f} ms"
+def _iso(dt): return _utc(dt).isoformat()
 
 def _sanitize(endpoint: str) -> str:
     endpoint = (endpoint or "").rstrip("/v1/traces").rstrip("/v1/metrics").strip()
@@ -53,6 +63,8 @@ ready_event = threading.Event()
 ready_uid = None  # type: str | None
 processed = set()
 service_by_uid = {}
+pod_name_by_uid = {}
+namespace_by_uid = {}
 
 STAGES = OrderedDict([
     ("stage1-scheduling",      "Pod Scheduling"),
@@ -65,6 +77,81 @@ STAGES = OrderedDict([
 ])
 
 v1: client.CoreV1Api  # set later
+
+# ────────────  File outputs  ────────────
+HISTORY_LOG = None          # logs/stage_timings.ndjson
+BEST_CURRENT_JSON = None    # logs/latest_and_best.json
+
+def _ensure_logs_dir(logs_dir: str):
+    path = pathlib.Path(logs_dir)
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+def _write_history(record: dict):
+    try:
+        with open(HISTORY_LOG, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except Exception as e:
+        log.warning("Failed writing history log: %s", e)
+
+_best_lock = threading.Lock()
+_best_overall = None  # cached best by lowest total_ms (coldstarts only)
+
+def _update_latest_and_best(current_record: dict):
+    global _best_overall
+    with _best_lock:
+        cur_total = current_record.get("total_ms", float("inf"))
+        # Only coldstart entries can become "best_overall"
+        if (current_record.get("kind") == "coldstart" and
+            (_best_overall is None or cur_total < _best_overall.get("total_ms", float("inf")))):
+            _best_overall = current_record
+        payload = {
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+            "current": current_record,
+            "best_overall": _best_overall,
+        }
+        try:
+            with open(BEST_CURRENT_JSON, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            log.warning("Failed writing latest_and_best.json: %s", e)
+
+def _serialize_record(uid: str, kind: str = "coldstart") -> dict:
+    with pod_lock:
+        timings = pod_timings.get(uid, {}).copy()
+        name = pod_state.get(uid, {}).get("name", pod_name_by_uid.get(uid))
+        ns = pod_state.get(uid, {}).get("namespace", namespace_by_uid.get(uid))
+        svc = service_by_uid.get(uid, "unknown")
+
+    if not timings:
+        return {}
+
+    try:
+        total_ms = (timings["stage7-first-request"][1] - timings["stage1-scheduling"][0]).total_seconds()*1000
+    except Exception:
+        total_ms = sum(v[2] for v in timings.values())
+
+    stages = {}
+    for sid, label in STAGES.items():
+        if sid in timings:
+            start, end, ms = timings[sid]
+            stages[sid] = {
+                "label": label,
+                "start": _iso(start),
+                "end": _iso(end),
+                "duration_ms": round(ms, 3),
+            }
+
+    return {
+        "kind": kind,  # "coldstart" or "reprobe"
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "namespace": ns,
+        "service": svc,
+        "pod_uid": uid,
+        "pod_name": name,
+        "total_ms": round(total_ms, 3),
+        "stages": stages,
+    }
 
 # ────────────  Span + timing helpers  ────────────
 def emit_span(stage, start, end, uid):
@@ -121,6 +208,9 @@ def process_pod(pod):
     if uid in processed:
         return
 
+    pod_name_by_uid[uid] = name
+    namespace_by_uid[uid] = ns
+
     log.info("Saw pod %s in %s (phase=%s)", name, ns, pod.status.phase)
 
     st = pod_state.setdefault(uid, {"namespace": ns, "name": name})
@@ -170,7 +260,7 @@ def setup_k8s():
 def watch_pods(ns, selector):
     setup_k8s()
 
-    # 1) Initial LIST (prime + get resourceVersion)
+    # 1) Initial LIST
     resp = v1.list_namespaced_pod(ns, label_selector=selector or "")
     log.info("Initial list: %d pod(s) matched selector '%s'", len(resp.items), selector or "<all>")
     for p in resp.items:
@@ -204,7 +294,7 @@ def watch_pods(ns, selector):
             w.stop()
 
 # ───────  HTTP probe (Stages 4/6/7)  ───────
-def probe(url, uid, ready_ts):
+def probe(url, uid, ready_ts, kind: str = "coldstart"):
     t0 = datetime.now(timezone.utc)
     for _ in range(60):
         try:
@@ -223,61 +313,157 @@ def probe(url, uid, ready_ts):
     except requests.RequestException:
         status = -1
     emit_span("stage7-first-request", t7, datetime.now(timezone.utc), uid)
-    log.info("First request HTTP status: %s", status)
+    log.info("[%s] First request HTTP status: %s", kind, status)
+
+# ───────  Periodic cold-start trigger (delete a pod)  ───────
+def periodic_coldstart(ns: str, selector: str, period_sec: int, jitter_sec: int = 10):
+    """
+    Every 'period_sec', delete one running pod matching 'selector' in 'ns'.
+    The watcher will see the new pod and profile it as a cold start.
+    Requires RBAC to delete pods in 'ns'.
+    """
+    if period_sec <= 0:
+        return
+    setup_k8s()
+    # First wait a tiny bit so we don't clash immediately with start-up
+    time.sleep(min(5, period_sec))
+    while True:
+        try:
+            pods = v1.list_namespaced_pod(ns, label_selector=selector or "")
+            candidates = [p for p in pods.items if (p.status.phase in ("Running", "Pending"))]
+            if not candidates:
+                log.info("[periodic] No pods found for selector='%s' in ns=%s", selector, ns)
+            else:
+                victim = random.choice(candidates)
+                log.info("[periodic] Deleting pod %s to force cold start …", victim.metadata.name)
+                try:
+                    v1.delete_namespaced_pod(victim.metadata.name, ns, grace_period_seconds=0)
+                except ApiException as e:
+                    # 404/409 are common if it disappeared between list & delete
+                    log.warning("[periodic] Failed to delete pod %s: %s", victim.metadata.name, e)
+        except Exception as e:
+            log.warning("[periodic] Error during periodic cold start: %s", e)
+
+        # Sleep period with small jitter to avoid alignment with other jobs
+        sleep_s = period_sec + random.randint(0, max(1, jitter_sec))
+        time.sleep(sleep_s)
 
 # ───────  main  ───────
 def main():
-    ap = argparse.ArgumentParser("Cold-start profiler (every pod)")
+    ap = argparse.ArgumentParser("Cold-start profiler (every pod + periodic cold starts)")
     ap.add_argument("--namespace", required=True,
                     help="Namespace to watch (e.g., default)")
     ap.add_argument("--selector", required=True,
                     help="Label selector (e.g., 'serving.knative.dev/service=httpbin')")
     ap.add_argument("--url", required=False,
                     help="Route URL to probe; if omitted, auto-discovers from Knative service")
+    ap.add_argument("--logs-dir", default="logs",
+                    help="Directory to write logs (default: ./logs)")
+    ap.add_argument("--reprobe-every", type=int, default=0,
+                    help="If >0, periodically re-probe the same URL (steady-state) and log entries as kind='reprobe' every N seconds (NOT a cold start).")
+    ap.add_argument("--periodic-coldstart-every-minutes", type=int, default=20,
+                    help="If >0, every N minutes delete a current pod matching --selector to force a new cold start that will be profiled.")
     args = ap.parse_args()
 
+    # Prepare file paths
+    logs_path = _ensure_logs_dir(args.logs_dir)
+    global HISTORY_LOG, BEST_CURRENT_JSON
+    HISTORY_LOG = str(logs_path / "stage_timings.ndjson")
+    BEST_CURRENT_JSON = str(logs_path / "latest_and_best.json")
+
+    # Start the watch thread
     threading.Thread(target=watch_pods,
                      args=(args.namespace, args.selector),
                      daemon=True).start()
+
+    # Start the periodic cold-start thread
+    period_sec = max(0, args.periodic_coldstart_every_minutes) * 60
+    if period_sec > 0:
+        threading.Thread(target=periodic_coldstart,
+                         args=(args.namespace, args.selector, period_sec),
+                         daemon=True).start()
+        log.info("Periodic cold-start enabled: every %d minutes", args.periodic_coldstart_every_minutes)
+    else:
+        log.info("Periodic cold-start disabled")
+
     log.info("Profiler running in ns=%s selector='%s' (URL=%s)",
              args.namespace, args.selector, args.url or "<auto>")
 
+    # Optional steady-state re-probe loop state
+    next_reprobe_at = 0
+    last_probe_target = None  # (url, uid, ready_ts)
+
     while True:
-        ready_event.wait()
-        uid = ready_uid
-        ready_event.clear()
-        if uid in processed:
-            continue
-        processed.add(uid)
-
-        st = pod_state.get(uid, {})
-        ready_ts = st.get("ready") or st.get("scheduled") or datetime.now(timezone.utc)
-
-        # Determine probe URL: explicit > auto from Knative service label
-        probe_url = args.url
-        if not probe_url:
-            svc = service_by_uid.get(uid)
-            ns = st.get("namespace", args.namespace)
-            if svc:
-                probe_url = f"http://{svc}.{ns}.svc.cluster.local"
-                log.info("Auto-discovered probe URL: %s", probe_url)
-            else:
-                log.warning("No service label found for pod %s; skipping HTTP probe", uid[:6])
-
-        if probe_url:
+        # If a pod just became Ready, profile it (coldstart)
+        if ready_event.wait(timeout=1.0):
+            uid = None
             try:
-                probe(probe_url, uid, ready_ts)
+                uid = ready_uid
+            finally:
+                ready_event.clear()
+            if uid and uid not in processed:
+                processed.add(uid)
+
+                st = pod_state.get(uid, {})
+                ready_ts = st.get("ready") or st.get("scheduled") or datetime.now(timezone.utc)
+
+                # Determine probe URL: explicit > auto from Knative service label
+                probe_url = args.url
+                if not probe_url:
+                    svc = service_by_uid.get(uid)
+                    ns = st.get("namespace", args.namespace)
+                    if svc:
+                        probe_url = f"http://{svc}.{ns}.svc.cluster.local"
+                        log.info("Auto-discovered probe URL: %s", probe_url)
+                    else:
+                        log.warning("No service label found for pod %s; skipping HTTP probe", uid[:6])
+
+                if probe_url:
+                    try:
+                        probe(probe_url, uid, ready_ts, kind="coldstart")
+                    except Exception as e:
+                        log.warning("Probe failed for %s: %s", uid[:6], e)
+
+                # Wait up to 120s for stage 5 to be recorded (queue-proxy ready)
+                deadline = time.time() + 120
+                while ("stage5-runtime-startup" not in pod_timings.get(uid, {})
+                       and time.time() < deadline):
+                    time.sleep(0.5)
+
+                print_table(uid)
+
+                # Persist results — history + latest/best
+                record = _serialize_record(uid, kind="coldstart")
+                if record:
+                    _write_history(record)
+                    _update_latest_and_best(record)
+
+                # Enable re-probe loop if wanted
+                if args.reprobe_every > 0 and probe_url:
+                    last_probe_target = (probe_url, uid, ready_ts)
+                    next_reprobe_at = time.time() + args.reprobe_every
+
+                log.info("Done with pod %s — waiting for next Ready pod …", uid[:6])
+
+        # Steady-state re-probe (optional, NOT a cold start)
+        if args.reprobe_every > 0 and last_probe_target and time.time() >= next_reprobe_at:
+            probe_url, uid, ready_ts = last_probe_target
+            alias_uid = f"{uid}-reprobe-{int(time.time())}"
+            with pod_lock:
+                pod_timings[alias_uid] = {}
+                service_by_uid[alias_uid] = service_by_uid.get(uid, "unknown")
+                pod_state[alias_uid] = pod_state.get(uid, {}).copy()
+            try:
+                probe(probe_url, alias_uid, ready_ts, kind="reprobe")
             except Exception as e:
-                log.warning("Probe failed for %s: %s", uid[:6], e)
+                log.warning("Re-probe failed: %s", e)
 
-        # Wait up to 120s for stage 5 to be recorded (queue-proxy ready)
-        deadline = time.time() + 120
-        while ("stage5-runtime-startup" not in pod_timings.get(uid, {})
-               and time.time() < deadline):
-            time.sleep(0.5)
+            record = _serialize_record(alias_uid, kind="reprobe")
+            if record:
+                _write_history(record)
+                _update_latest_and_best(record)
 
-        print_table(uid)
-        log.info("Done with pod %s — waiting for next Ready pod …", uid[:6])
+            next_reprobe_at = time.time() + args.reprobe_every
 
 if __name__ == "__main__":
     main()
