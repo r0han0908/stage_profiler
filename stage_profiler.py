@@ -1,34 +1,40 @@
 #!/usr/bin/env python3
 """
-Knative cold-start stage profiler (+ wake-from-zero + revision-aware naming)
-----------------------------------------------------------------------------
+Knative cold-start stage profiler (passive, revision-aware, 10-min monitoring)
+-----------------------------------------------------------------------------
+• Pure monitoring: NO wake-from-zero, NO periodic deletes.
 • Profiles every new pod (robust LIST + WATCH).
-• Derives all seven stages from the Kubernetes API:
-    1) stage1-scheduling      (PodScheduled True)
-    2) stage2-image-pull      (first containers Running; uses latest started_at across containers)
+• Derives seven stages from the Kubernetes API:
+    1) stage1-scheduling      (PodScheduled=True)
+    2) stage2-image-pull      (containers Running; uses latest started_at across containers)
     3) stage3-container-init  (ContainersReady/Ready=True)
-    4) stage4-proxy-warmup    (HTTP polling until first 200 OK)
+    4) stage4-proxy-warmup    (HTTP polling until first 200 OK; requires --url)
     5) stage5-runtime-startup (queue-proxy container Ready)
     6) stage6-app-init        (Ready→first 200 OK window)
     7) stage7-first-request   (timing of the first measured request)
 • If API-server closes the stream, it reconnects.
-• If there are zero pods and wake-from-zero is enabled, it sends requests to `--url`
-  (or http://<ksvc>.<ns>.svc.cluster.local) to trigger scale from zero, then profiles.
+
+Behavior:
+- Keeps watching current pods; when a pod becomes Ready, profiles a **cold start**.
+- Every 10 minutes, performs a **passive monitoring reprobe** (if --url is set) against the
+  last Ready pod for the service and logs a “reprobe” run (no waking).
+- Detects a **new Knative Revision** (label: serving.knative.dev/revision). The first run for a new
+  revision is labeled `revisioned-<n>` and the 10-min timer is **reset** after that run.
 
 Structured logs:
-  - logs/stage_timings.ndjson   (append-only history; one JSON per coldstart/reprobe)
+  - logs/stage_timings.ndjson   (append-only history; one JSON per run)
   - logs/latest_and_best.json   ({"current": ..., "best_overall": ...})
 
-Run naming / revision-aware / interval reset:
-• Each profiling run gets a human label: "profiling-<n>".
-• If the run is the first one for a newly detected Knative Revision, it is labeled "revisioned-<n>".
-• When a new Revision is detected, the periodic cold-start trigger schedule is reset immediately.
+Usage:
+  python stage_profiler.py --namespace default \
+    --selector 'serving.knative.dev/service=httpbin' \
+    --url http://httpbin.default.svc.cluster.local
 """
 
 import os, json, logging, argparse, threading, time, pathlib, random
 from collections import OrderedDict
 from datetime import datetime, timezone
-from urllib.parse import urlparse, urlencode
+from urllib.parse import urlparse
 from typing import Optional, Tuple, Dict
 
 import requests
@@ -40,6 +46,9 @@ from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExport
 from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
+
+# ────────────  Config  ────────────
+REPROBE_EVERY_SEC = 10 * 60  # fixed 10 minutes
 
 # ────────────  Logging  ────────────
 level = os.getenv("LOGLEVEL", "INFO").upper()
@@ -53,7 +62,6 @@ def _ms(sec: float) -> str:
     return f"{sec*1e3:.2f} ms"
 def _iso(dt: datetime) -> str:
     return _utc(dt).isoformat()
-
 def _sanitize(endpoint: str) -> str:
     endpoint = (endpoint or "").rstrip("/v1/traces").rstrip("/v1/metrics").strip()
     return urlparse(endpoint).netloc if endpoint.startswith(("http://", "https://")) else endpoint
@@ -71,6 +79,7 @@ tracer = trace.get_tracer(__name__)
 pod_state: Dict[str, dict] = {}
 pod_timings: Dict[str, dict] = {}
 pod_lock = threading.Lock()
+
 ready_event = threading.Event()
 ready_uid: Optional[str] = None
 processed = set()
@@ -87,14 +96,11 @@ rev_run_counter = 0
 run_name_by_uid: Dict[str, str] = {}
 known_revisions: set = set()
 revision_profiled_once: set = set()   # only the first profile for a new revision is "revisioned-*"
-last_revision_seen: Optional[str] = None
 
-# Periodic scheduler control (resettable on new revision)
+# Periodic passive monitoring (reprobe) control
 periodic_lock = threading.Lock()
 periodic_next_at = 0.0
-
-# Single-flight guard for wake attempts (prevents interleaved wake hits)
-wake_sf_lock = threading.Lock()
+last_probe_target: Optional[Tuple[str, str, datetime]] = None  # (url, uid, ready_ts)
 
 STAGES = OrderedDict([
     ("stage1-scheduling",      "Pod Scheduling"),
@@ -169,7 +175,9 @@ def print_table(uid: str):
     if not timings:
         return
     svc = service_by_uid.get(uid, "unknown")
-    total = (timings["stage7-first-request"][1] - timings["stage1-scheduling"][0]).total_seconds()*1000
+    total = (timings["stage7-first-request"][1] - timings["stage1-scheduling"][0]).total_seconds()*1000 \
+            if ("stage7-first-request" in timings and "stage1-scheduling" in timings) else \
+            sum(v[2] for v in timings.values())
     run_name = run_name_by_uid.get(uid, "profiling-0")
     print("\n\u250f" + "━"*70 + "┓")
     print(f"┃ {'COLD START PROFILE ' + '(' + run_name + ')':^68} ┃")
@@ -219,7 +227,7 @@ def _rev_name(pod) -> Optional[str]:
     return lbl.get("serving.knative.dev/revision")
 
 def process_pod(pod):
-    global ready_uid, last_revision_seen
+    global ready_uid
     uid, name, ns = pod.metadata.uid, pod.metadata.name, pod.metadata.namespace
     if uid in processed:
         return
@@ -228,14 +236,9 @@ def process_pod(pod):
     namespace_by_uid[uid] = ns
     if (rev := _rev_name(pod)):
         revision_by_uid[uid] = rev
-        # detect first time we see this revision
         if rev not in known_revisions:
             known_revisions.add(rev)
-            last_revision_seen = rev
             log.info("[revision] New revision detected: %s", rev)
-            with periodic_lock:
-                global periodic_next_at
-                periodic_next_at = time.time()  # force periodic trigger schedule reset
 
     log.info("Saw pod %s in %s (phase=%s)", name, ns, pod.status.phase)
 
@@ -250,7 +253,7 @@ def process_pod(pod):
             if (svc := _svc_name(pod)):
                 service_by_uid[uid] = svc
 
-    # Stage 2: choose latest started_at across containers
+    # Stage 2: choose latest started_at across containers (robust)
     if "scheduled" in st and "running" not in st:
         latest = None
         for cs in (pod.status.container_statuses or []):
@@ -308,8 +311,7 @@ def watch_pods(ns: str, selector: str):
             ):
                 et = ev.get("type")
                 obj = ev.get("object")
-                # Guard against Status/timeouts that are dicts or lack .metadata
-                if not hasattr(obj, "metadata"):
+                if not hasattr(obj, "metadata"):   # skip Status/timeouts
                     continue
                 if et == "BOOKMARK":
                     rv = obj.metadata.resource_version
@@ -323,9 +325,10 @@ def watch_pods(ns: str, selector: str):
         finally:
             w.stop()
 
-# ───────  Probe helpers (Stages 4/6/7 + wake)  ───────
-def probe(url: str, uid: str, ready_ts: datetime, kind: str = "coldstart"):
-    # Stage 4 proxy warm-up (poll service until first 200)
+# ───────  Probe helpers (Stages 4/6/7)  ───────
+def probe(url: str, uid: str, ready_ts: datetime, kind: str):
+    """Perform stages 4,6,7 using a couple of HTTP GETs (no wake/deletes)."""
+    # Stage 4: poll until first 200
     t0 = datetime.now(timezone.utc)
     for _ in range(60):
         try:
@@ -338,7 +341,7 @@ def probe(url: str, uid: str, ready_ts: datetime, kind: str = "coldstart"):
     emit_span("stage4-proxy-warmup", t0, t4_end, uid)
     emit_span("stage6-app-init", ready_ts, t4_end, uid)
 
-    # Stage 7 first-request timing (one more request)
+    # Stage 7: one more request
     t7 = datetime.now(timezone.utc)
     try:
         status = requests.get(url, timeout=5).status_code
@@ -364,108 +367,8 @@ def _build_probe_url(ns: str, selector: str, explicit_url: Optional[str]) -> Opt
         return f"http://{svc}.{ns}.svc.cluster.local"
     return None
 
-# ★ Single-flight wake with early cancel
-def wake_service(url: Optional[str], retries: int, interval_s: int,
-                 ns: Optional[str] = None, selector: Optional[str] = None):
-    """
-    Send a few HTTP GETs to trigger scale-from-zero, but:
-    - single-flight: only one thread wakes at a time
-    - cancel early: stop as soon as any matching pod appears
-    """
-    if not url:
-        log.info("[wake] no URL to wake")
-        return
-
-    if not wake_sf_lock.acquire(blocking=False):
-        log.debug("[wake] wake already in progress; skipping")
-        return
-
-    def pods_exist() -> bool:
-        if not (ns and selector):
-            return False
-        try:
-            return len(list_matching_pods(ns, selector).items) > 0
-        except Exception:
-            return False
-
-    try:
-        for i in range(max(1, retries)):
-            if pods_exist():
-                log.info("[wake] cancel: pod(s) detected; stopping further wake attempts")
-                break
-
-            try:
-                q = {"wake": int(time.time()), "r": random.randint(0, 1_000_000)}
-                sep = "&" if "?" in url else "?"
-                target = f"{url}{sep}{urlencode(q)}"
-                log.info("[wake] hitting %s (attempt %d/%d)", target, i+1, retries)
-                requests.get(target, timeout=5)
-            except requests.RequestException:
-                pass
-
-            if i < retries - 1:
-                deadline = time.time() + interval_s
-                while time.time() < deadline:
-                    if pods_exist():
-                        log.info("[wake] cancel during wait: pod(s) detected")
-                        return
-                    time.sleep(0.2)
-    finally:
-        wake_sf_lock.release()
-
-# ───────  Periodic cold-start trigger (delete a pod or wake if zero)  ───────
-def periodic_coldstart(ns: str, selector: str, period_sec: int, wake_url: Optional[str],
-                       wake_retries: int, wake_interval_s: int, jitter_sec: int = 10):
-    if period_sec <= 0:
-        return
-    with periodic_lock:
-        global periodic_next_at
-        periodic_next_at = time.time() + min(5, period_sec)
-
-    while True:
-        now = time.time()
-        with periodic_lock:
-            due = now >= periodic_next_at
-        if due:
-            try:
-                pods = list_matching_pods(ns, selector)
-                candidates = [p for p in pods.items if (p.status.phase in ("Running", "Pending"))]
-                if not candidates:
-                    log.info("[periodic] no pods to delete; likely scaled to zero — sending wake")
-                    wake_service(wake_url, retries=wake_retries, interval_s=wake_interval_s, ns=ns, selector=selector)
-                else:
-                    victim = random.choice(candidates)
-                    log.info("[periodic] Deleting pod %s to force cold start …", victim.metadata.name)
-                    try:
-                        v1.delete_namespaced_pod(victim.metadata.name, ns, grace_period_seconds=0)
-                    except ApiException as e:
-                        log.warning("[periodic] Failed to delete pod %s: %s", victim.metadata.name, e)
-            except Exception as e:
-                log.warning("[periodic] Error during periodic cold start: %s", e)
-
-            with periodic_lock:
-                jitter = random.randint(0, max(1, jitter_sec))
-                periodic_next_at = time.time() + period_sec + jitter
-        time.sleep(1)
-
-# ───────  Zero-watcher: wake when there are zero pods  ───────
-def zero_watcher(ns: str, selector: str, wake_url: Optional[str],
-                 wake_enabled: bool, wake_interval_s: int, wake_retries: int):
-    if not wake_enabled:
-        return
-    time.sleep(3)
-    while True:
-        try:
-            pods = list_matching_pods(ns, selector)
-            if len(pods.items) == 0:
-                log.info("[zero] 0 pods for selector='%s' — sending wake", selector)
-                wake_service(wake_url, retries=wake_retries, interval_s=wake_interval_s, ns=ns, selector=selector)
-        except Exception as e:
-            log.warning("[zero] error checking pod count: %s", e)
-        time.sleep(wake_interval_s)
-
 # ───────  JSON serialization ───────
-def _serialize_record(uid: str, kind: str = "coldstart") -> dict:
+def _serialize_record(uid: str, kind: str) -> dict:
     with pod_lock:
         timings = pod_timings.get(uid, {}).copy()
         name = pod_state.get(uid, {}).get("name", pod_name_by_uid.get(uid))
@@ -476,24 +379,18 @@ def _serialize_record(uid: str, kind: str = "coldstart") -> dict:
     if not timings:
         return {}
 
-    try:
+    if ("stage7-first-request" in timings and "stage1-scheduling" in timings):
         total_ms = (timings["stage7-first-request"][1] - timings["stage1-scheduling"][0]).total_seconds()*1000
-    except Exception:
+    else:
         total_ms = sum(v[2] for v in timings.values())
 
     stages = {}
     for sid, label in STAGES.items():
         if sid in timings:
             start, end, ms = timings[sid]
-            stages[sid] = {
-                "label": label,
-                "start": _iso(start),
-                "end": _iso(end),
-                "duration_ms": round(ms, 3),
-            }
+            stages[sid] = {"label": label, "start": _iso(start), "end": _iso(end), "duration_ms": round(ms, 3)}
 
     run_label = run_name_by_uid.get(uid, "profiling-0")
-
     return {
         "kind": kind,  # "coldstart" or "reprobe"
         "run_name": run_label,
@@ -508,40 +405,70 @@ def _serialize_record(uid: str, kind: str = "coldstart") -> dict:
     }
 
 # Run-name assignment helpers
-def assign_run_name(uid: str):
-    """Assign profiling-N by default; if this uid's revision is new and unprofiled → revisioned-N."""
+def assign_run_name(uid: str, is_revision_first_run: bool):
     global run_counter, rev_run_counter
-    rev = revision_by_uid.get(uid)
-    is_revision_event = (rev is not None and rev in known_revisions and rev not in revision_profiled_once)
     with run_lock:
-        if is_revision_event:
+        if is_revision_first_run:
             rev_run_counter += 1
             run_name_by_uid[uid] = f"revisioned-{rev_run_counter}"
-            revision_profiled_once.add(rev)
         else:
             run_counter += 1
             run_name_by_uid[uid] = f"profiling-{run_counter}"
 
+# ───────  Passive periodic monitoring (reprobe)  ───────
+def periodic_monitor():
+    global periodic_next_at
+    with periodic_lock:
+        periodic_next_at = time.time() + REPROBE_EVERY_SEC
+    while True:
+        time.sleep(0.5)
+        with periodic_lock:
+            if time.time() < periodic_next_at:
+                continue
+        # time to reprobe (if we have a target and a URL)
+        tgt = None
+        with pod_lock:
+            # last_probe_target is set after a coldstart run completes
+            tgt = last_probe_target
+        if not tgt:
+            with periodic_lock:
+                periodic_next_at = time.time() + REPROBE_EVERY_SEC
+            continue
+        probe_url, uid, ready_ts = tgt
+        if not probe_url:
+            with periodic_lock:
+                periodic_next_at = time.time() + REPROBE_EVERY_SEC
+            continue
+
+        alias_uid = f"{uid}-reprobe-{int(time.time())}"
+        with pod_lock:
+            pod_timings[alias_uid] = {}
+            service_by_uid[alias_uid] = service_by_uid.get(uid, "unknown")
+            namespace_by_uid[alias_uid] = namespace_by_uid.get(uid, "unknown")
+            revision_by_uid[alias_uid] = revision_by_uid.get(uid, "unknown")
+            pod_state[alias_uid] = pod_state.get(uid, {}).copy()
+
+        assign_run_name(alias_uid, is_revision_first_run=False)
+        try:
+            probe(probe_url, alias_uid, ready_ts, kind="reprobe")
+        except Exception as e:
+            log.warning("Re-probe failed: %s", e)
+
+        record = _serialize_record(alias_uid, kind="reprobe")
+        if record:
+            _write_line(HISTORY_LOG, record)
+            _update_latest_and_best(record)
+
+        with periodic_lock:
+            periodic_next_at = time.time() + REPROBE_EVERY_SEC
+
 # ───────  main  ───────
 def main():
-    ap = argparse.ArgumentParser("Cold-start profiler (every pod + periodic cold starts + wake-from-zero)")
+    ap = argparse.ArgumentParser("Cold-start profiler (passive; no wake/probe forcing; 10-min monitoring)")
     ap.add_argument("--namespace", required=True, help="Namespace to watch (e.g., default)")
     ap.add_argument("--selector", required=True, help="Label selector (e.g., 'serving.knative.dev/service=httpbin')")
-    ap.add_argument("--url", required=False, help="Route URL to probe/wake; if omitted, tries 'http://<ksvc>.<ns>.svc.cluster.local'")
+    ap.add_argument("--url", required=False, help="Service URL to probe for stages 4/6/7; if omitted, those stages are skipped")
     ap.add_argument("--logs-dir", default="logs", help="Directory to write logs (default: ./logs)")
-    ap.add_argument("--reprobe-every", type=int, default=0,
-                    help="If >0, periodically re-probe the same URL (steady-state) and log entries as kind='reprobe' every N seconds (NOT a cold start).")
-    # Defaults requested:
-    ap.add_argument("--periodic-coldstart-every-minutes", type=int, default=20,
-                    help="Every N minutes delete a current pod; if none, wake the service to trigger a new cold start. (default: 20)")
-    ap.add_argument("--wake-when-zero", dest="wake_when_zero", action="store_true", default=True,
-                    help="Send requests to wake the service when no pods are present (default: on)")
-    ap.add_argument("--no-wake-when-zero", dest="wake_when_zero", action="store_false",
-                    help="Disable wake-from-zero behavior")
-    ap.add_argument("--wake-interval-seconds", type=int, default=20*60,
-                    help="Seconds between wake attempts/checks when zero pods are present (default: 1200 = 20 minutes)")
-    ap.add_argument("--wake-retries", type=int, default=3,
-                    help="Number of wake HTTP attempts per wake cycle (default: 3)")
     args = ap.parse_args()
 
     # Prepare file paths
@@ -553,38 +480,20 @@ def main():
     # One-time client initialization
     setup_k8s()
 
-    # Compute a wake/probe URL usable even when scaled to zero
-    wake_probe_url = _build_probe_url(args.namespace, args.selector, args.url)
-    if wake_probe_url:
-        log.info("Wake/Probe URL: %s", wake_probe_url)
+    # Derive a probe URL from selector if not provided (still passive; no wake/deletes)
+    probe_url = _build_probe_url(args.namespace, args.selector, args.url)
+    if probe_url:
+        log.info("Probe URL: %s", probe_url)
     else:
-        log.warning("No wake/probe URL could be derived. Provide --url or include serving.knative.dev/service=<name> in --selector.")
+        log.info("No probe URL; stages 4/6/7 will be skipped.")
 
-    # Start the watch thread (always running; if no pods, we just wait)
+    # Start the watch thread
     threading.Thread(target=watch_pods, args=(args.namespace, args.selector), daemon=True).start()
 
-    # Start the periodic cold-start thread (delete or wake)
-    period_sec = max(0, args.periodic_coldstart_every_minutes) * 60
-    if period_sec > 0:
-        threading.Thread(target=periodic_coldstart,
-                         args=(args.namespace, args.selector, period_sec, wake_probe_url,
-                               args.wake_retries, args.wake_interval_seconds),
-                         daemon=True).start()
-        log.info("Periodic cold-start enabled: every %d minutes", args.periodic_coldstart_every_minutes)
-    else:
-        log.info("Periodic cold-start disabled")
+    # Start passive periodic monitoring thread
+    threading.Thread(target=periodic_monitor, daemon=True).start()
 
-    # Start zero watcher (wake when 0 pods)
-    threading.Thread(target=zero_watcher,
-                     args=(args.namespace, args.selector, wake_probe_url,
-                           args.wake_when_zero, args.wake_interval_seconds, args.wake_retries),
-                     daemon=True).start()
-
-    log.info("Profiler running in ns=%s selector='%s' (URL=%s)", args.namespace, args.selector, wake_probe_url or "<none>")
-
-    # Optional steady-state re-probe loop state
-    next_reprobe_at = 0.0
-    last_probe_target: Optional[Tuple[str, str, datetime]] = None  # (url, uid, ready_ts)
+    log.info("Profiler running in ns=%s selector='%s' (URL=%s)", args.namespace, args.selector, probe_url or "<none>")
 
     while True:
         # If a pod just became Ready, finish profiling it (coldstart)
@@ -600,10 +509,13 @@ def main():
                 st = pod_state.get(uid, {})
                 ready_ts = st.get("ready") or st.get("scheduled") or datetime.now(timezone.utc)
 
-                # Run naming (profiling-N vs revisioned-N)
-                assign_run_name(uid)
+                # Determine if this is the first run for a newly seen revision
+                rev = revision_by_uid.get(uid)
+                is_revision_first_run = (rev is not None and rev in known_revisions and rev not in revision_profiled_once)
+                assign_run_name(uid, is_revision_first_run=is_revision_first_run)
+                if is_revision_first_run:
+                    revision_profiled_once.add(rev)
 
-                probe_url = wake_probe_url
                 if probe_url:
                     try:
                         probe(probe_url, uid, ready_ts, kind="coldstart")
@@ -623,41 +535,19 @@ def main():
                     _write_line(HISTORY_LOG, record)
                     _update_latest_and_best(record)
 
-                # Enable re-probe loop if wanted
-                if args.reprobe_every > 0 and probe_url:
-                    last_probe_target = (probe_url, uid, ready_ts)
-                    next_reprobe_at = time.time() + args.reprobe_every
+                # Remember target for passive 10-min reprobe
+                if probe_url:
+                    with pod_lock:
+                        global last_probe_target
+                        last_probe_target = (probe_url, uid, ready_ts)
+
+                # Reset the 10-min schedule if this was a revisioned run
+                if is_revision_first_run:
+                    with periodic_lock:
+                        global periodic_next_at
+                        periodic_next_at = time.time() + REPROBE_EVERY_SEC
 
                 log.info("Done with pod %s — waiting for next Ready pod …", uid[:6])
-
-        # Steady-state re-probe (optional, NOT a cold start)
-        if args.reprobe_every > 0 and last_probe_target and time.time() >= next_reprobe_at:
-            probe_url, uid, ready_ts = last_probe_target
-            alias_uid = f"{uid}-reprobe-{int(time.time())}"
-            with pod_lock:
-                pod_timings[alias_uid] = {}
-                service_by_uid[alias_uid] = service_by_uid.get(uid, "unknown")
-                namespace_by_uid[alias_uid] = namespace_by_uid.get(uid, "unknown")
-                revision_by_uid[alias_uid] = revision_by_uid.get(uid, "unknown")
-                pod_state[alias_uid] = pod_state.get(uid, {}).copy()
-
-            # assign a profiling run name for reprobe as well (non-revisioned)
-            with run_lock:
-                global run_counter
-                run_counter += 1
-                run_name_by_uid[alias_uid] = f"profiling-{run_counter}"
-
-            try:
-                probe(probe_url, alias_uid, ready_ts, kind="reprobe")
-            except Exception as e:
-                log.warning("Re-probe failed: %s", e)
-
-            record = _serialize_record(alias_uid, kind="reprobe")
-            if record:
-                _write_line(HISTORY_LOG, record)
-                _update_latest_and_best(record)
-
-            next_reprobe_at = time.time() + args.reprobe_every
 
 if __name__ == "__main__":
     main()
