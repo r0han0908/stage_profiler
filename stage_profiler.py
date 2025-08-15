@@ -22,18 +22,14 @@ Structured logs:
 Run naming / revision-aware / interval reset:
 • Each profiling run gets a human label: "profiling-<n>".
 • If the run is the first one for a newly detected Knative Revision, it is labeled "revisioned-<n>".
-• When a new Revision is detected, the periodic (10-min) cold-start trigger schedule is reset immediately.
-
-Notes:
-• For revision detection we rely on the pod label "serving.knative.dev/revision".
-• Optional steady-state "reprobe" can emit warm-first-request timings between cold starts.
+• When a new Revision is detected, the periodic cold-start trigger schedule is reset immediately.
 """
 
 import os, json, logging, argparse, threading, time, pathlib, random
-from collections import OrderedDict, deque
+from collections import OrderedDict
 from datetime import datetime, timezone
 from urllib.parse import urlparse, urlencode
-from typing import Optional, Tuple, Dict, List
+from typing import Optional, Tuple, Dict
 
 import requests
 from kubernetes import client, config, watch
@@ -96,6 +92,9 @@ last_revision_seen: Optional[str] = None
 # Periodic scheduler control (resettable on new revision)
 periodic_lock = threading.Lock()
 periodic_next_at = 0.0
+
+# Single-flight guard for wake attempts (prevents interleaved wake hits)
+wake_sf_lock = threading.Lock()
 
 STAGES = OrderedDict([
     ("stage1-scheduling",      "Pod Scheduling"),
@@ -251,7 +250,7 @@ def process_pod(pod):
             if (svc := _svc_name(pod)):
                 service_by_uid[uid] = svc
 
-    # Stage 2: choose latest started_at across containers (robust for multiple containers)
+    # Stage 2: choose latest started_at across containers
     if "scheduled" in st and "running" not in st:
         latest = None
         for cs in (pod.status.container_statuses or []):
@@ -290,8 +289,6 @@ def list_matching_pods(ns: str, selector: str):
     return v1.list_namespaced_pod(ns, label_selector=selector or "")
 
 def watch_pods(ns: str, selector: str):
-    setup_k8s()
-    # Initial LIST
     resp = list_matching_pods(ns, selector)
     log.info("Initial list: %d pod(s) matched selector '%s'", len(resp.items), selector or "<all>")
     for p in resp.items:
@@ -311,7 +308,7 @@ def watch_pods(ns: str, selector: str):
             ):
                 et = ev.get("type")
                 obj = ev.get("object")
-                # Some servers yield Status dicts on timeouts/bookmarks; guard them
+                # Guard against Status/timeouts that are dicts or lack .metadata
                 if not hasattr(obj, "metadata"):
                     continue
                 if et == "BOOKMARK":
@@ -367,28 +364,60 @@ def _build_probe_url(ns: str, selector: str, explicit_url: Optional[str]) -> Opt
         return f"http://{svc}.{ns}.svc.cluster.local"
     return None
 
-def wake_service(url: Optional[str], retries: int, interval_s: int):
+# ★ Single-flight wake with early cancel
+def wake_service(url: Optional[str], retries: int, interval_s: int,
+                 ns: Optional[str] = None, selector: Optional[str] = None):
+    """
+    Send a few HTTP GETs to trigger scale-from-zero, but:
+    - single-flight: only one thread wakes at a time
+    - cancel early: stop as soon as any matching pod appears
+    """
     if not url:
         log.info("[wake] no URL to wake")
         return
-    for i in range(max(1, retries)):
+
+    if not wake_sf_lock.acquire(blocking=False):
+        log.debug("[wake] wake already in progress; skipping")
+        return
+
+    def pods_exist() -> bool:
+        if not (ns and selector):
+            return False
         try:
-            q = {"wake": int(time.time()), "r": random.randint(0, 1_000_000)}
-            sep = "&" if "?" in url else "?"
-            target = f"{url}{sep}{urlencode(q)}"
-            log.info("[wake] hitting %s (attempt %d/%d)", target, i+1, retries)
-            requests.get(target, timeout=5)
-        except requests.RequestException:
-            pass
-        if i < retries - 1:
-            time.sleep(interval_s)
+            return len(list_matching_pods(ns, selector).items) > 0
+        except Exception:
+            return False
+
+    try:
+        for i in range(max(1, retries)):
+            if pods_exist():
+                log.info("[wake] cancel: pod(s) detected; stopping further wake attempts")
+                break
+
+            try:
+                q = {"wake": int(time.time()), "r": random.randint(0, 1_000_000)}
+                sep = "&" if "?" in url else "?"
+                target = f"{url}{sep}{urlencode(q)}"
+                log.info("[wake] hitting %s (attempt %d/%d)", target, i+1, retries)
+                requests.get(target, timeout=5)
+            except requests.RequestException:
+                pass
+
+            if i < retries - 1:
+                deadline = time.time() + interval_s
+                while time.time() < deadline:
+                    if pods_exist():
+                        log.info("[wake] cancel during wait: pod(s) detected")
+                        return
+                    time.sleep(0.2)
+    finally:
+        wake_sf_lock.release()
 
 # ───────  Periodic cold-start trigger (delete a pod or wake if zero)  ───────
 def periodic_coldstart(ns: str, selector: str, period_sec: int, wake_url: Optional[str],
                        wake_retries: int, wake_interval_s: int, jitter_sec: int = 10):
     if period_sec <= 0:
         return
-    setup_k8s()
     with periodic_lock:
         global periodic_next_at
         periodic_next_at = time.time() + min(5, period_sec)
@@ -403,7 +432,7 @@ def periodic_coldstart(ns: str, selector: str, period_sec: int, wake_url: Option
                 candidates = [p for p in pods.items if (p.status.phase in ("Running", "Pending"))]
                 if not candidates:
                     log.info("[periodic] no pods to delete; likely scaled to zero — sending wake")
-                    wake_service(wake_url, retries=wake_retries, interval_s=wake_interval_s)
+                    wake_service(wake_url, retries=wake_retries, interval_s=wake_interval_s, ns=ns, selector=selector)
                 else:
                     victim = random.choice(candidates)
                     log.info("[periodic] Deleting pod %s to force cold start …", victim.metadata.name)
@@ -424,14 +453,13 @@ def zero_watcher(ns: str, selector: str, wake_url: Optional[str],
                  wake_enabled: bool, wake_interval_s: int, wake_retries: int):
     if not wake_enabled:
         return
-    setup_k8s()
     time.sleep(3)
     while True:
         try:
             pods = list_matching_pods(ns, selector)
             if len(pods.items) == 0:
                 log.info("[zero] 0 pods for selector='%s' — sending wake", selector)
-                wake_service(wake_url, retries=wake_retries, interval_s=wake_interval_s)
+                wake_service(wake_url, retries=wake_retries, interval_s=wake_interval_s, ns=ns, selector=selector)
         except Exception as e:
             log.warning("[zero] error checking pod count: %s", e)
         time.sleep(wake_interval_s)
@@ -464,7 +492,6 @@ def _serialize_record(uid: str, kind: str = "coldstart") -> dict:
                 "duration_ms": round(ms, 3),
             }
 
-    # include human run label
     run_label = run_name_by_uid.get(uid, "profiling-0")
 
     return {
@@ -504,15 +531,17 @@ def main():
     ap.add_argument("--logs-dir", default="logs", help="Directory to write logs (default: ./logs)")
     ap.add_argument("--reprobe-every", type=int, default=0,
                     help="If >0, periodically re-probe the same URL (steady-state) and log entries as kind='reprobe' every N seconds (NOT a cold start).")
-    ap.add_argument("--periodic-coldstart-every-minutes", type=int, default=10,
-                    help="If >0, every N minutes delete a current pod; if none, wake the service to trigger a new cold start.")
-    # wake-from-zero controls
+    # Defaults requested:
+    ap.add_argument("--periodic-coldstart-every-minutes", type=int, default=20,
+                    help="Every N minutes delete a current pod; if none, wake the service to trigger a new cold start. (default: 20)")
     ap.add_argument("--wake-when-zero", dest="wake_when_zero", action="store_true", default=True,
                     help="Send requests to wake the service when no pods are present (default: on)")
     ap.add_argument("--no-wake-when-zero", dest="wake_when_zero", action="store_false",
                     help="Disable wake-from-zero behavior")
-    ap.add_argument("--wake-interval-seconds", type=int, default=15, help="Seconds between wake attempts/checks when zero pods are present")
-    ap.add_argument("--wake-retries", type=int, default=3, help="Number of wake HTTP attempts per wake cycle")
+    ap.add_argument("--wake-interval-seconds", type=int, default=20*60,
+                    help="Seconds between wake attempts/checks when zero pods are present (default: 1200 = 20 minutes)")
+    ap.add_argument("--wake-retries", type=int, default=3,
+                    help="Number of wake HTTP attempts per wake cycle (default: 3)")
     args = ap.parse_args()
 
     # Prepare file paths
@@ -520,6 +549,9 @@ def main():
     global HISTORY_LOG, BEST_CURRENT_JSON
     HISTORY_LOG = str(logs_path / "stage_timings.ndjson")
     BEST_CURRENT_JSON = str(logs_path / "latest_and_best.json")
+
+    # One-time client initialization
+    setup_k8s()
 
     # Compute a wake/probe URL usable even when scaled to zero
     wake_probe_url = _build_probe_url(args.namespace, args.selector, args.url)
@@ -611,6 +643,7 @@ def main():
 
             # assign a profiling run name for reprobe as well (non-revisioned)
             with run_lock:
+                global run_counter
                 run_counter += 1
                 run_name_by_uid[alias_uid] = f"profiling-{run_counter}"
 
