@@ -1,25 +1,26 @@
 #!/usr/bin/env python3
 """
-Knative cold-start stage profiler (passive, revision-aware, 10-min monitoring)
------------------------------------------------------------------------------
-• Pure monitoring: NO wake-from-zero, NO periodic deletes.
+Knative cold-start stage profiler (15-min monitoring + wake-if-zero + revision-aware)
+------------------------------------------------------------------------------------
 • Profiles every new pod (robust LIST + WATCH).
 • Derives seven stages from the Kubernetes API:
     1) stage1-scheduling      (PodScheduled=True)
-    2) stage2-image-pull      (containers Running; uses latest started_at across containers)
+    2) stage2-image-pull      (containers Running; latest started_at across containers)
     3) stage3-container-init  (ContainersReady/Ready=True)
-    4) stage4-proxy-warmup    (HTTP polling until first 200 OK; requires --url)
+    4) stage4-proxy-warmup    (HTTP polling until first 200 OK; requires --url or derivable URL)
     5) stage5-runtime-startup (queue-proxy container Ready)
     6) stage6-app-init        (Ready→first 200 OK window)
     7) stage7-first-request   (timing of the first measured request)
 • If API-server closes the stream, it reconnects.
 
-Behavior:
-- Keeps watching current pods; when a pod becomes Ready, profiles a **cold start**.
-- Every 10 minutes, performs a **passive monitoring reprobe** (if --url is set) against the
-  last Ready pod for the service and logs a “reprobe” run (no waking).
-- Detects a **new Knative Revision** (label: serving.knative.dev/revision). The first run for a new
-  revision is labeled `revisioned-<n>` and the 10-min timer is **reset** after that run.
+Behavior (exact per your spec):
+- Every 15 minutes (fixed), run a monitoring cycle:
+    * If the service currently has 0 pods **and minScale==0**, send a few HTTP requests to the
+      service URL to trigger scale-from-zero. The watch thread then profiles that cold start.
+    * If pods exist, perform a warm **reprobe** (no deletes) and log as kind="reprobe".
+- Detects a **new Knative Revision** (label serving.knative.dev/revision); the first profile for a new
+  revision is named 'revisioned-<n>' and **resets the 15-min timer** right after that run.
+- No pod deletions. No continuous zero watcher — only the 15-min cadence.
 
 Structured logs:
   - logs/stage_timings.ndjson   (append-only history; one JSON per run)
@@ -34,7 +35,7 @@ Usage:
 import os, json, logging, argparse, threading, time, pathlib, random
 from collections import OrderedDict
 from datetime import datetime, timezone
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlencode
 from typing import Optional, Tuple, Dict
 
 import requests
@@ -48,7 +49,7 @@ from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
 
 # ────────────  Config  ────────────
-REPROBE_EVERY_SEC = 10 * 60  # fixed 10 minutes
+REPROBE_EVERY_SEC = 15 * 60  # fixed 15 minutes
 
 # ────────────  Logging  ────────────
 level = os.getenv("LOGLEVEL", "INFO").upper()
@@ -95,9 +96,9 @@ run_counter = 0
 rev_run_counter = 0
 run_name_by_uid: Dict[str, str] = {}
 known_revisions: set = set()
-revision_profiled_once: set = set()   # only the first profile for a new revision is "revisioned-*"
+revision_profiled_once: set = set()   # first profile per revision → "revisioned-*"
 
-# Periodic passive monitoring (reprobe) control
+# Periodic monitoring control
 periodic_lock = threading.Lock()
 periodic_next_at = 0.0
 last_probe_target: Optional[Tuple[str, str, datetime]] = None  # (url, uid, ready_ts)
@@ -113,6 +114,7 @@ STAGES = OrderedDict([
 ])
 
 v1: client.CoreV1Api  # set later
+coapi: client.CustomObjectsApi  # set later
 
 # ────────────  File outputs  ────────────
 HISTORY_LOG = None          # logs/stage_timings.ndjson
@@ -194,7 +196,6 @@ def print_table(uid: str):
 
 # ───────  Stage-5 monitor (queue-proxy)  ───────
 def monitor_qproxy(ns: str, pod_name: str, uid: str, sched_ts: datetime):
-    # quick pre-check
     try:
         pod = v1.read_namespaced_pod(pod_name, ns)
         for cs in (pod.status.container_statuses or []):
@@ -253,7 +254,7 @@ def process_pod(pod):
             if (svc := _svc_name(pod)):
                 service_by_uid[uid] = svc
 
-    # Stage 2: choose latest started_at across containers (robust)
+    # Stage 2: latest started_at across containers
     if "scheduled" in st and "running" not in st:
         latest = None
         for cs in (pod.status.container_statuses or []):
@@ -279,7 +280,7 @@ def process_pod(pod):
 
 # ───────  Kubernetes watch loop (robust)  ───────
 def setup_k8s():
-    global v1
+    global v1, coapi
     try:
         config.load_incluster_config()
         log.info("Loaded in-cluster config")
@@ -287,6 +288,7 @@ def setup_k8s():
         config.load_kube_config()
         log.info("Loaded kubeconfig")
     v1 = client.CoreV1Api()
+    coapi = client.CustomObjectsApi()
 
 def list_matching_pods(ns: str, selector: str):
     return v1.list_namespaced_pod(ns, label_selector=selector or "")
@@ -297,7 +299,6 @@ def watch_pods(ns: str, selector: str):
     for p in resp.items:
         process_pod(p)
     rv = resp.metadata.resource_version
-    # WATCH
     while True:
         w = watch.Watch()
         try:
@@ -311,7 +312,7 @@ def watch_pods(ns: str, selector: str):
             ):
                 et = ev.get("type")
                 obj = ev.get("object")
-                if not hasattr(obj, "metadata"):   # skip Status/timeouts
+                if obj is None or not hasattr(obj, "metadata"):
                     continue
                 if et == "BOOKMARK":
                     rv = obj.metadata.resource_version
@@ -325,10 +326,47 @@ def watch_pods(ns: str, selector: str):
         finally:
             w.stop()
 
-# ───────  Probe helpers (Stages 4/6/7)  ───────
+# ───────  Knative helpers ───────
+def _extract_knative_service_from_selector(selector: str) -> Optional[str]:
+    if not selector:
+        return None
+    parts = [p.strip() for p in selector.split(",")]
+    for p in parts:
+        if p.startswith("serving.knative.dev/service="):
+            return p.split("=", 1)[1]
+    return None
+
+def _build_probe_url(ns: str, selector: str, explicit_url: Optional[str]) -> Optional[str]:
+    if explicit_url:
+        return explicit_url
+    svc = _extract_knative_service_from_selector(selector)
+    if svc:
+        return f"http://{svc}.{ns}.svc.cluster.local"
+    return None
+
+def get_ksvc(co: client.CustomObjectsApi, ns: str, name: str) -> Optional[dict]:
+    try:
+        return co.get_namespaced_custom_object(
+            group="serving.knative.dev", version="v1",
+            namespace=ns, plural="services", name=name
+        )
+    except Exception:
+        return None
+
+def get_min_scale(co: client.CustomObjectsApi, ns: str, name: str) -> Optional[int]:
+    ksvc = get_ksvc(co, ns, name)
+    if not ksvc:
+        return None
+    ann = (((ksvc.get("spec") or {}).get("template") or {}).get("metadata") or {}).get("annotations") or {}
+    val = ann.get("autoscaling.knative.dev/minScale")
+    try:
+        return int(val) if val is not None else None
+    except Exception:
+        return None
+
+# ───────  Probe + wake helpers (Stages 4/6/7 + optional wake)  ───────
 def probe(url: str, uid: str, ready_ts: datetime, kind: str):
-    """Perform stages 4,6,7 using a couple of HTTP GETs (no wake/deletes)."""
-    # Stage 4: poll until first 200
+    # Stage 4: poll until first 200 (up to ~30s)
     t0 = datetime.now(timezone.utc)
     for _ in range(60):
         try:
@@ -350,22 +388,21 @@ def probe(url: str, uid: str, ready_ts: datetime, kind: str):
     emit_span("stage7-first-request", t7, datetime.now(timezone.utc), uid)
     log.info("[%s] First request HTTP status: %s", kind, status)
 
-def _extract_knative_service_from_selector(selector: str) -> Optional[str]:
-    if not selector:
-        return None
-    parts = [p.strip() for p in selector.split(",")]
-    for p in parts:
-        if p.startswith("serving.knative.dev/service="):
-            return p.split("=", 1)[1]
-    return None
-
-def _build_probe_url(ns: str, selector: str, explicit_url: Optional[str]) -> Optional[str]:
-    if explicit_url:
-        return explicit_url
-    svc = _extract_knative_service_from_selector(selector)
-    if svc:
-        return f"http://{svc}.{ns}.svc.cluster.local"
-    return None
+def wake_service(url: Optional[str], attempts: int = 3, interval_s: int = 5):
+    if not url:
+        log.info("[wake] no URL to wake")
+        return
+    for i in range(max(1, attempts)):
+        try:
+            q = {"wake": int(time.time()), "r": random.randint(0, 1_000_000)}
+            sep = "&" if "?" in url else "?"
+            target = f"{url}{sep}{urlencode(q)}"
+            log.info("[wake] hitting %s (attempt %d/%d)", target, i+1, attempts)
+            requests.get(target, timeout=5)
+        except requests.RequestException:
+            pass
+        if i < attempts - 1:
+            time.sleep(interval_s)
 
 # ───────  JSON serialization ───────
 def _serialize_record(uid: str, kind: str) -> dict:
@@ -404,7 +441,6 @@ def _serialize_record(uid: str, kind: str) -> dict:
         "stages": stages,
     }
 
-# Run-name assignment helpers
 def assign_run_name(uid: str, is_revision_first_run: bool):
     global run_counter, rev_run_counter
     with run_lock:
@@ -415,31 +451,48 @@ def assign_run_name(uid: str, is_revision_first_run: bool):
             run_counter += 1
             run_name_by_uid[uid] = f"profiling-{run_counter}"
 
-# ───────  Passive periodic monitoring (reprobe)  ───────
-def periodic_monitor():
+# ───────  15-min monitoring thread  ───────
+def periodic_monitor(ns: str, selector: str, probe_url: Optional[str], ksvc_name: Optional[str]):
     global periodic_next_at
     with periodic_lock:
         periodic_next_at = time.time() + REPROBE_EVERY_SEC
     while True:
         time.sleep(0.5)
         with periodic_lock:
-            if time.time() < periodic_next_at:
-                continue
-        # time to reprobe (if we have a target and a URL)
-        tgt = None
-        with pod_lock:
-            # last_probe_target is set after a coldstart run completes
-            tgt = last_probe_target
-        if not tgt:
-            with periodic_lock:
-                periodic_next_at = time.time() + REPROBE_EVERY_SEC
+            due = (time.time() >= periodic_next_at)
+        if not due:
             continue
-        probe_url, uid, ready_ts = tgt
-        if not probe_url:
+
+        # Determine current pod count
+        pods = list_matching_pods(ns, selector)
+        pod_cnt = len(pods.items) if pods and getattr(pods, "items", None) is not None else 0
+
+        # Decide action based on minScale and pod count
+        minscale = None
+        if ksvc_name:
+            try:
+                minscale = get_min_scale(coapi, ns, ksvc_name)
+            except Exception:
+                minscale = None
+
+        if pod_cnt == 0 and (minscale == 0) and probe_url:
+            log.info("[monitor] 0 pods & minScale=0 — waking service to capture next cold start")
+            wake_service(probe_url, attempts=3, interval_s=5)
+            # The watch thread will capture the coldstart run when the pod becomes Ready.
             with periodic_lock:
                 periodic_next_at = time.time() + REPROBE_EVERY_SEC
             continue
 
+        # Otherwise, if we have a target pod and URL, perform a warm reprobe
+        tgt = None
+        with pod_lock:
+            tgt = last_probe_target
+        if not tgt or not probe_url:
+            with periodic_lock:
+                periodic_next_at = time.time() + REPROBE_EVERY_SEC
+            continue
+
+        reprobe_url, uid, ready_ts = tgt
         alias_uid = f"{uid}-reprobe-{int(time.time())}"
         with pod_lock:
             pod_timings[alias_uid] = {}
@@ -450,7 +503,7 @@ def periodic_monitor():
 
         assign_run_name(alias_uid, is_revision_first_run=False)
         try:
-            probe(probe_url, alias_uid, ready_ts, kind="reprobe")
+            probe(reprobe_url, alias_uid, ready_ts, kind="reprobe")
         except Exception as e:
             log.warning("Re-probe failed: %s", e)
 
@@ -464,10 +517,10 @@ def periodic_monitor():
 
 # ───────  main  ───────
 def main():
-    ap = argparse.ArgumentParser("Cold-start profiler (passive; no wake/probe forcing; 10-min monitoring)")
+    ap = argparse.ArgumentParser("Cold-start profiler (15-min monitoring; wake-if-zero; revision-aware)")
     ap.add_argument("--namespace", required=True, help="Namespace to watch (e.g., default)")
     ap.add_argument("--selector", required=True, help="Label selector (e.g., 'serving.knative.dev/service=httpbin')")
-    ap.add_argument("--url", required=False, help="Service URL to probe for stages 4/6/7; if omitted, those stages are skipped")
+    ap.add_argument("--url", required=False, help="Service URL to probe/wake; if omitted, tries 'http://<ksvc>.<ns>.svc.cluster.local'")
     ap.add_argument("--logs-dir", default="logs", help="Directory to write logs (default: ./logs)")
     args = ap.parse_args()
 
@@ -477,21 +530,25 @@ def main():
     HISTORY_LOG = str(logs_path / "stage_timings.ndjson")
     BEST_CURRENT_JSON = str(logs_path / "latest_and_best.json")
 
-    # One-time client initialization
+    # Clients
     setup_k8s()
 
-    # Derive a probe URL from selector if not provided (still passive; no wake/deletes)
+    # Compute a probe URL usable even when scaled to zero
     probe_url = _build_probe_url(args.namespace, args.selector, args.url)
     if probe_url:
-        log.info("Probe URL: %s", probe_url)
+        log.info("Probe/Wake URL: %s", probe_url)
     else:
-        log.info("No probe URL; stages 4/6/7 will be skipped.")
+        log.warning("No probe URL could be derived. Provide --url or include serving.knative.dev/service=<name> in --selector.")
+
+    ksvc_name = _extract_knative_service_from_selector(args.selector)
 
     # Start the watch thread
     threading.Thread(target=watch_pods, args=(args.namespace, args.selector), daemon=True).start()
 
-    # Start passive periodic monitoring thread
-    threading.Thread(target=periodic_monitor, daemon=True).start()
+    # Start 15-min monitoring thread
+    threading.Thread(target=periodic_monitor,
+                     args=(args.namespace, args.selector, probe_url, ksvc_name),
+                     daemon=True).start()
 
     log.info("Profiler running in ns=%s selector='%s' (URL=%s)", args.namespace, args.selector, probe_url or "<none>")
 
@@ -535,13 +592,13 @@ def main():
                     _write_line(HISTORY_LOG, record)
                     _update_latest_and_best(record)
 
-                # Remember target for passive 10-min reprobe
+                # Remember target for warm reprobes
                 if probe_url:
                     with pod_lock:
                         global last_probe_target
                         last_probe_target = (probe_url, uid, ready_ts)
 
-                # Reset the 10-min schedule if this was a revisioned run
+                # Reset the 15-min schedule if this was a revisioned run
                 if is_revision_first_run:
                     with periodic_lock:
                         global periodic_next_at
