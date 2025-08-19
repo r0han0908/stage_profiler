@@ -24,7 +24,7 @@ Behavior (exact per your spec):
 
 Structured logs:
   - logs/stage_timings.ndjson   (append-only history; one JSON per run)
-  - logs/latest_and_previous.json   ({"latest": ..., "previous": ...})
+  - logs/latest_and_previous.json   ({"baseline": ..., "latest": ..., "previous": ...})
 
 Usage:
   python stage_profiler.py --namespace default \
@@ -139,26 +139,50 @@ def _write_json(path: str, obj: dict):
     except Exception as e:
         log.warning("Failed writing %s: %s", path, e)
 
-# latest & previous tracker
+# latest & previous tracker (+ baseline)
 _lp_lock = threading.Lock()
 _previous_record = None  # last run we wrote (any kind)
+_baseline_record = None  # very first run ever (persisted)
 
 def _update_latest_and_previous(current_record: dict):
     """
-    Persist a small JSON doc keeping only the latest run and the immediately previous one.
+    Persist a small JSON doc keeping:
+      - baseline: the very first recorded run ever (sticky across restarts)
+      - latest: the current run
+      - previous: the run immediately before the current one
     {
       "updated_at": "...",
+      "baseline": {...first_record...},
       "latest":   {...current_record...},
       "previous": {...previous_record...} | None
     }
     """
-    global _previous_record
+    global _previous_record, _baseline_record
+
     with _lp_lock:
+        # Bootstrap baseline/previous from existing file if present (for persistence across restarts)
+        if _baseline_record is None:
+            try:
+                with open(LATEST_PREVIOUS_JSON, "r", encoding="utf-8") as f:
+                    existing = json.load(f)
+                    _baseline_record = existing.get("baseline")
+                    if _previous_record is None:
+                        _previous_record = existing.get("latest")
+            except Exception:
+                # File may not exist yet or be unreadable; we'll set baseline below
+                pass
+
+        # If still no baseline, this is the very first record — set it now.
+        if _baseline_record is None:
+            _baseline_record = current_record
+
         payload = {
             "updated_at": datetime.now(timezone.utc).isoformat(),
+            "baseline": _baseline_record,
             "latest": current_record,
             "previous": _previous_record,
         }
+
         _write_json(LATEST_PREVIOUS_JSON, payload)
         _previous_record = current_record
 
@@ -591,7 +615,7 @@ def main():
 
                 print_table(uid)
 
-                # Persist results — history + latest/previous
+                # Persist results — history + latest/previous (+ baseline)
                 record = _serialize_record(uid, kind="coldstart")
                 if record:
                     _write_line(HISTORY_LOG, record)
